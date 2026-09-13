@@ -164,17 +164,33 @@ Item {
     || scopeSearch.pending
   function previewDescriptor(serial, index) {
     if (!root.cursorActive || index < 0 || index >= displayModel.count) return { kind: "" }
-    return MenuModel.previewForRow(displayModel.get(index))
+    return MenuModel.previewForRow(displayModel.get(index), Date.now())
   }
   readonly property var resultPreview: root.previewDescriptor(layoutSerial, selectedIndex)
   readonly property bool previewVisible: !root.dmenuActive && resultPreview.kind !== ""
     && !root.deleteConfirmOpen && !actionPanel.opened
+  function hasPreviewableRows(serial) {
+    for (var i = 0; i < displayModel.count; i++) {
+      if (MenuModel.previewForRow(displayModel.get(i)).kind !== "") return true
+    }
+    return false
+  }
+  // Reserve the detail column when this result set can actually use it. This
+  // keeps mixed results stable while allowing fallback actions and loading or
+  // empty states to use—and center within—the full fixed-width card.
+  readonly property bool previewSpaceReserved: !root.dmenuActive
+    && root.hasPreviewableRows(layoutSerial)
   readonly property int previewPaneWidth: Style.space(300)
-  readonly property int baseCardWidth: root.dmenuActive ? Style.space(root.dmenuWidth)
-    : ((root.filterText.trim().length > 0 || (root.item(root.activeMenu) && root.item(root.activeMenu).scope)
-      || root.activeMenu === "trigger.capture.screenrecord" || root.activeMenu === "style.font") ? Style.space(420) : Style.space(300))
-  property int cardWidth: Math.min(baseCardWidth + (previewVisible ? Style.space(320) : 0), panel.width - Style.gapsOut * 2)
-  property int visibleRowsHeight: root.dmenuActive ? dmenuRowListHeight(layoutSerial, displayModel.count, filterText) : rowListHeight(layoutSerial, displayModel.count, filterText, searchDivider)
+  readonly property int standardCardWidth: Style.space(740)
+  // Keep every normal launcher route in one centered frame. Select/input
+  // callers intentionally retain their requested width as part of the dmenu
+  // protocol, but root, submenus, search, and preview views never resize.
+  property int cardWidth: Math.min(root.dmenuActive ? Style.space(root.dmenuWidth)
+    : root.standardCardWidth, panel.width - Style.gapsOut * 2)
+  // layoutSerial advances when displayed rows change. Do not bind height to
+  // filterText directly: that forced a full row/layout walk synchronously on
+  // every key, before the debounced result model had changed at all.
+  property int visibleRowsHeight: root.dmenuActive ? dmenuRowListHeight(layoutSerial, displayModel.count) : rowListHeight(layoutSerial, displayModel.count, searchDivider)
   property int cardHeight: root.dmenuActive
     ? Math.min(contentMargin * 2 + headerHeight + (mode === "input" ? 0 : contentSpacing + visibleRowsHeight), panel.height - Style.gapsOut * 2)
     : Math.min(Math.max(contentMargin * 2 + headerHeight + contentSpacing + visibleRowsHeight,
@@ -210,9 +226,10 @@ Item {
   // Menu rows only surface their detail while a search is narrowing them;
   // dmenu rows carry caller-supplied subtext that must always be visible.
   // Scoped submenus display item details immediately for context.
-  function rowHeightForDetail(detail) {
+  function rowHeightForDetail(detail, kind) {
     var isScoped = Boolean(root.item(root.activeMenu) && root.item(root.activeMenu).scope)
-    return (root.filterText || root.dmenuActive || isScoped) && detail ? root.detailRowHeight : root.baseRowHeight
+    return kind !== "fallback" && (root.filterText || root.dmenuActive || isScoped) && detail
+      ? root.detailRowHeight : root.baseRowHeight
   }
 
   // Height the card can devote to rows before running off the screen — or
@@ -246,7 +263,7 @@ Item {
     return totals[full - 1] + root.rowSpacing + peek
   }
 
-  function rowListHeight(_serial, _count, _filter, _divider) {
+  function rowListHeight(_serial, _count, _divider) {
     if (displayModel.count === 0) return root.baseRowHeight
 
     var totals = []
@@ -257,7 +274,7 @@ Item {
       var row = displayModel.get(i)
       if (i > 0) total += root.rowSpacing
       if (row.section === "drilldown" && previousSection !== "drilldown") total += root.dividerHeight
-      total += root.rowHeightForDetail(row.detail)
+      total += root.rowHeightForDetail(row.detail, row.kind)
       previousSection = row.section
       totals.push(total)
     }
@@ -265,7 +282,7 @@ Item {
     return foldedListHeight(totals, availableRowsHeight())
   }
 
-  function dmenuRowListHeight(_serial, _count, _filter) {
+  function dmenuRowListHeight(_serial, _count) {
     if (root.mode === "input") return 0
     if (displayModel.count === 0) return root.baseRowHeight
 
@@ -276,7 +293,8 @@ Item {
     var total = 0
     for (var i = 0; i < displayModel.count; i++) {
       if (i > 0) total += root.rowSpacing
-      total += root.rowHeightForDetail(displayModel.get(i).detail)
+      var row = displayModel.get(i)
+      total += root.rowHeightForDetail(row.detail, row.kind)
       totals.push(total)
     }
 
@@ -365,10 +383,12 @@ Item {
       var appId = String(entry.id || "")
       if (!appId) continue
       var subtext = root.appLibrary.entrySubtext(entry)
-      var aliases = subtext ? [subtext] : []
-      try {
-        if (entry.keywords && typeof entry.keywords.join === "function") aliases = aliases.concat(entry.keywords)
-      } catch (e) { }
+      var summary = String(entry.comment || "")
+      var categories = root.appLibrary.stringList(entry.categories)
+      var aliases = root.appLibrary.stringList(entry.keywords)
+      if (subtext) aliases.push(subtext)
+      if (summary) aliases.push(summary)
+      aliases = aliases.concat(categories)
       appRows.push({
         id: "apps." + appId,
         parent: "apps",
@@ -376,6 +396,10 @@ Item {
         icon: "",
         appIcon: String(entry.icon || ""),
         appId: appId,
+        appSubtitle: subtext,
+        summary: summary,
+        categories: categories,
+        desktopActions: root.appLibrary.desktopActionDescriptors(entry),
         label: root.appLibrary.entryName(entry),
         title: "",
         target: "",
@@ -656,6 +680,10 @@ Item {
         iconFont: "",
         appIcon: "",
         appId: "",
+        appSubtitle: "",
+        summary: "",
+        categories: [],
+        desktopActions: [],
         label: label,
         target: "",
         detail: detail,
@@ -886,15 +914,16 @@ Item {
           iconFont: "",
           appIcon: "",
           appId: "",
-          label: "Ask agent about “" + query + "”",
+          label: "Ask Agent",
           target: "",
-          detail: "Agent > Ask",
+          detail: "Default coding agent",
           path: "",
           childCount: 0,
           action: "omarchy agent prompt " + Util.shellQuote(query),
           provider: "",
           score: 0,
-          section: ""
+          section: "",
+          accessories: [{ id: "context", icon: "", text: "Default agent", label: "Runs with" }]
         })
         if (active === "root") {
           rows.push({
@@ -904,15 +933,16 @@ Item {
             iconFont: "",
             appIcon: "",
             appId: "",
-            label: "Search web for “" + query + "”",
+            label: "Search the Web",
             target: "",
-            detail: "Web > Search",
+            detail: "Default search engine",
             path: "",
             childCount: 0,
             action: "omarchy-websearch " + Util.shellQuote(query),
             provider: "",
             score: 1,
-            section: ""
+            section: "",
+            accessories: [{ id: "context", icon: "", text: "Default browser", label: "Opens with" }]
           })
         }
       }
@@ -1019,13 +1049,18 @@ Item {
 
   function setFilter(nextFilter) {
     panel.freezeCardTop()
-    scopeSearch.cancel()
+    var previousWasEmpty = !root.filterText.trim()
+    var activeEntry = root.item(root.activeMenu)
+    if (activeEntry && activeEntry.scope) scopeSearch.cancel()
     root.filterText = nextFilter
     root.selectedIndex = 0
     root.cursorActive = root.mode !== "input"
     root.disarmPointer()
     if (!root.dmenuActive && root.filterText.trim()) {
-      root.loadProvidersForSearch()
+      // Provider discovery is only needed when search begins. Once queued,
+      // providers drain independently; walking the whole catalog again for
+      // every subsequent character only delays keyboard event handling.
+      if (previousWasEmpty) root.loadProvidersForSearch()
       calcDebounceTimer.restart()
     } else {
       root.calcResult = ""
@@ -1188,6 +1223,17 @@ Item {
       root.frecencyMap = map
       root.rebuildDisplay()
       Util.execDetached("omarchy-activity " + action.operation + " " + Util.shellQuote(activityKey)
+        + " --kind " + Util.shellQuote(row.kind))
+    } else if (action.operation === "desktop-action" && row.kind === "app") {
+      root.cancel()
+      if (root.appLibrary) root.appLibrary.executeDesktopAction(row.appId, action.target, row.label)
+    } else if (action.operation === "reset-ranking") {
+      var rankingKey = MenuModel.activityKeyForRow(row)
+      var rankingMap = Object.assign({}, root.frecencyMap || ({}))
+      delete rankingMap[rankingKey]
+      root.frecencyMap = rankingMap
+      root.rebuildDisplay()
+      Util.execDetached("omarchy-activity forget " + Util.shellQuote(rankingKey)
         + " --kind " + Util.shellQuote(row.kind))
     } else if (action.operation === "uninstall" && row.kind === "app") {
       root.deleteTarget = { appId: row.appId, label: row.label }
@@ -1434,7 +1480,10 @@ Item {
 
   Timer {
     id: searchDebounceTimer
-    interval: 8
+    // Text itself updates immediately. Two display frames keep results feeling
+    // live while coalescing common 30-40 Hz key-repeat bursts instead of
+    // rebuilding the catalogue between every repeated key event.
+    interval: 32
     repeat: false
     onTriggered: root.rebuildDisplay()
   }
@@ -1830,7 +1879,7 @@ Item {
         anchors.topMargin: card.contentTopInset
         anchors.bottomMargin: card.contentBottomInset
         anchors.leftMargin: card.contentLeftInset
-        width: root.previewVisible
+        width: root.previewSpaceReserved
           ? parent.width - card.contentLeftInset - card.contentRightInset - root.previewPaneWidth - root.contentSpacing
           : parent.width - card.contentLeftInset - card.contentRightInset
         spacing: root.contentSpacing
@@ -1910,7 +1959,7 @@ Item {
               readonly property bool hasIcon: row.icon.length > 0 || row.isApp
 
               width: ListView.view.width
-              height: root.rowHeightForDetail(row.detail)
+              height: root.rowHeightForDetail(row.detail, row.kind)
               // Faded: the row is here to say the software is already
               // installed, not to be picked.
               opacity: row.disabled ? 0.4 : 1
@@ -1987,7 +2036,8 @@ Item {
                   textFormat: Text.PlainText
                   width: parent.width
                   text: row.detail
-                  visible: Boolean((root.filterText || row.kind === "dmenu" || (root.item(root.activeMenu) && root.item(root.activeMenu).scope)) && row.detail.length > 0)
+                  visible: row.kind !== "fallback"
+                    && Boolean((root.filterText || row.kind === "dmenu" || (root.item(root.activeMenu) && root.item(root.activeMenu).scope)) && row.detail.length > 0)
                   color: root.foreground
                   opacity: 0.52
                   font.family: root.fontFamily

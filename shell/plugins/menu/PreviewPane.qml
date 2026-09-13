@@ -86,7 +86,8 @@ Item {
 
     Rectangle {
       width: parent.width
-      height: Math.min(Style.space(210), Math.max(Style.space(110), root.height - Style.space(145)))
+      height: root.appPreview ? Style.space(142)
+        : Math.min(Style.space(210), Math.max(Style.space(110), root.height - Style.space(145)))
       radius: Style.cornerRadius
       color: Util.alpha(root.foreground, 0.045)
       clip: true
@@ -158,8 +159,59 @@ Item {
       font.family: root.fontFamily
       font.pixelSize: Style.font.bodySmall
       wrapMode: Text.WrapAnywhere
-      maximumLineCount: 4
+      maximumLineCount: root.appPreview ? 2 : 4
       elide: Text.ElideRight
+    }
+
+    Text {
+      width: parent.width
+      visible: root.appPreview && Boolean(root.descriptor.summary)
+      textFormat: Text.PlainText
+      text: root.descriptor.summary || ""
+      color: root.foreground
+      opacity: 0.76
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.bodySmall
+      wrapMode: Text.WordWrap
+      maximumLineCount: 3
+      elide: Text.ElideRight
+    }
+
+    Column {
+      width: parent.width
+      visible: root.appPreview && root.descriptor.metadata && root.descriptor.metadata.length > 0
+      spacing: Style.space(6)
+
+      Repeater {
+        model: root.descriptor.metadata || []
+
+        Row {
+          required property var modelData
+          width: parent.width
+          spacing: Style.space(8)
+
+          Text {
+            width: Style.space(82)
+            textFormat: Text.PlainText
+            text: modelData.label || ""
+            color: root.foreground
+            opacity: 0.42
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Text {
+            width: parent.width - Style.space(90)
+            textFormat: Text.PlainText
+            text: modelData.value || ""
+            color: root.foreground
+            opacity: 0.72
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            elide: Text.ElideRight
+          }
+        }
+      }
     }
   }
 }

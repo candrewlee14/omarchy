@@ -380,6 +380,11 @@ function damerauLevenshtein(a, b) {
   if (al === 0) return bl
   if (bl === 0) return al
   if (bl >= 63) return 99
+  // Typo matching never accepts more than two edits. Avoid filling a matrix
+  // when the length difference alone already makes a match impossible; this
+  // is especially important while a user holds a key or rapidly backspaces a
+  // long no-match query on the QML UI thread.
+  if (Math.abs(al - bl) > 2) return 99
 
   for (var j = 0; j <= bl; j++) levRow1[j] = j
 
@@ -656,7 +661,39 @@ function fileExtension(path) {
   return dot > 0 ? name.slice(dot + 1) : ""
 }
 
-function previewForRow(row) {
+var APP_CATEGORY_LABELS = {
+  AudioVideo: "Media", Audio: "Audio", Video: "Video",
+  Development: "Development", Education: "Education", Game: "Games",
+  Graphics: "Graphics", Network: "Internet", Office: "Office",
+  Science: "Science", Settings: "Settings", System: "System", Utility: "Utilities"
+}
+
+function appCategoryLabel(categories) {
+  var labels = []
+  var values = Array.isArray(categories) ? categories : []
+  for (var i = 0; i < values.length; i++) {
+    var label = APP_CATEGORY_LABELS[String(values[i] || "")]
+    if (label && labels.indexOf(label) < 0) labels.push(label)
+    if (labels.length === 2) break
+  }
+  return labels.join(" · ")
+}
+
+function appPreviewMetadata(row, nowMs) {
+  var metadata = []
+  var category = appCategoryLabel(row.categories)
+  if (category) metadata.push({ label: "Category", value: category })
+  if (row.lastUsed > 0) {
+    var age = relativeAge(row.lastUsed, nowMs)
+    metadata.push({ label: "Last opened", value: age === "now" ? "Just now" : age + " ago" })
+  }
+  if (row.useCount > 0)
+    metadata.push({ label: "Launches", value: row.useCount === 1 ? "Once" : String(row.useCount) + " times" })
+  if (row.appId) metadata.push({ label: "Application ID", value: String(row.appId) })
+  return metadata
+}
+
+function previewForRow(row, nowMs) {
   if (!row || row.disabled) return { kind: "" }
   var declaredKind = RESULT_PREVIEW_KINDS[row.kind] || ""
   if (!declaredKind) return { kind: "" }
@@ -671,7 +708,9 @@ function previewForRow(row) {
     kind: previewKind,
     resultKind: row.kind,
     title: row.label || row.target || "",
-    subtitle: row.detail || "",
+    subtitle: row.kind === "app" ? (row.appSubtitle || "") : (row.detail || ""),
+    summary: row.summary || "",
+    metadata: row.kind === "app" ? appPreviewMetadata(row, nowMs) : [],
     target: row.target || "",
     icon: row.icon || "",
     iconFont: row.iconFont || "",
@@ -854,6 +893,8 @@ var RESULT_ACTIONS = {
   copySessionId: { id: "copy-session-id", operation: "copy-target", icon: "", label: "Copy Session ID", shortcut: "" },
   pin: { id: "pin", operation: "pin", icon: "󰐃", label: "Pin Result", shortcut: "", when: { field: "pinned", equals: false } },
   unpin: { id: "unpin", operation: "unpin", icon: "󰤰", label: "Unpin Result", shortcut: "", when: { field: "pinned", equals: true } },
+  desktopActions: { operation: "desktop-action", source: "desktopActions" },
+  resetRanking: { id: "reset-ranking", operation: "reset-ranking", icon: "󰑐", label: "Reset Ranking", shortcut: "", when: { field: "activityKnown", equals: true } },
   forgetRecent: { id: "forget-recent", operation: "forget", icon: "󰆴", label: "Forget from Recents", shortcut: "", destructive: true },
   forgetConversation: { id: "forget-conversation", operation: "forget", icon: "󰆴", label: "Forget Conversation", shortcut: "", destructive: true },
   uninstallApp: { id: "uninstall-app", operation: "uninstall", icon: "󰆴", label: "Uninstall Application", shortcut: "", destructive: true }
@@ -863,7 +904,7 @@ var RESULT_ACTION_SETS = {
   file: ["primary", "openParent", "copyPath", "pin", "unpin", "forgetRecent"],
   project: ["primary", "openParent", "copyPath", "pin", "unpin", "forgetRecent"],
   "agent-session": ["primary", "copySessionId", "pin", "unpin", "forgetConversation"],
-  app: ["primary", "pin", "unpin", "uninstallApp"]
+  app: ["primary", "desktopActions", "pin", "unpin", "resetRanking", "uninstallApp"]
 }
 
 var PRIMARY_ACTION_LABELS = {
@@ -876,24 +917,39 @@ var PRIMARY_ACTION_LABELS = {
   link: "Open Menu"
 }
 
-function actionFromDefinition(name, row) {
+function actionsFromDefinition(name, row) {
   var definition = RESULT_ACTIONS[name]
-  if (!definition) return null
-  if (definition.when && row[definition.when.field] !== definition.when.equals) return null
-  return {
+  if (!definition) return []
+  if (definition.when && row[definition.when.field] !== definition.when.equals) return []
+  if (definition.source === "desktopActions") {
+    return (Array.isArray(row.desktopActions) ? row.desktopActions : []).map(function(action) {
+      return {
+        id: "desktop." + action.id,
+        operation: definition.operation,
+        target: action.id,
+        icon: "󰐊",
+        label: action.name,
+        shortcut: "",
+        destructive: false
+      }
+    })
+  }
+  return [{
     id: definition.id,
     operation: definition.operation,
     icon: definition.icon,
     label: name === "primary" ? (PRIMARY_ACTION_LABELS[row.kind] || definition.label) : definition.label,
     shortcut: definition.shortcut,
     destructive: definition.destructive === true
-  }
+  }]
 }
 
 function actionsForRow(row) {
   if (!row || row.disabled || row.kind === "hint") return []
   var names = RESULT_ACTION_SETS[row.kind] || ["primary"]
-  return names.map(function(name) { return actionFromDefinition(name, row) }).filter(function(action) { return action !== null })
+  var actions = []
+  for (var i = 0; i < names.length; i++) actions = actions.concat(actionsFromDefinition(names[i], row))
+  return actions
 }
 
 var RESULT_ACCESSORIES = {
@@ -951,10 +1007,16 @@ function decorateResultRows(rows, frecencyMap, nowMs) {
   return (rows || []).map(function(source) {
     var row = Object.assign({}, source)
     var record = (frecencyMap || {})[activityKeyForRow(row)] || {}
+    row.appSubtitle = row.appSubtitle || ""
+    row.summary = row.summary || ""
+    row.categories = Array.isArray(row.categories) ? row.categories : []
+    row.desktopActions = Array.isArray(row.desktopActions) ? row.desktopActions : []
     if (!(row.lastUsed > 0)) row.lastUsed = record.lastUsed || 0
     if (!(row.useCount > 0)) row.useCount = record.count || 0
     if (row.pinned !== true) row.pinned = record.pinned === true
-    row.accessories = accessoriesForRow(row, nowMs)
+    row.activityKnown = row.lastUsed > 0 || row.useCount > 0 || record.pinned === true
+    row.accessories = Array.isArray(row.accessories) && row.accessories.length > 0
+      ? row.accessories : accessoriesForRow(row, nowMs)
     return row
   })
 }
@@ -1014,9 +1076,14 @@ function displayRow(items, itemOrder, checkedResults, disabledResults, entry, de
     iconFont: entry.iconFont || "",
     appIcon: entry.appIcon || "",
     appId: entry.appId || "",
+    appSubtitle: entry.kind === "app" ? (entry.appSubtitle || entry.description || "") : "",
+    summary: entry.summary || "",
+    categories: Array.isArray(entry.categories) ? entry.categories : [],
+    desktopActions: Array.isArray(entry.desktopActions) ? entry.desktopActions : [],
     label: labelFor(entry, checkedResults, disabledResults),
     target: target,
-    detail: detail || "",
+    detail: entry.kind === "app" && (entry.appSubtitle || entry.description)
+      ? (entry.appSubtitle || entry.description) : (detail || ""),
     path: pathFor(items, entry.id),
     childCount: (entry.kind === "menu" || entry.kind === "link") ? childCount(items, itemOrder, target) : 0,
     action: entry.action || "",
@@ -1151,6 +1218,7 @@ if (typeof module !== "undefined") {
     fileSearchRows: fileSearchRows,
     fileExtension: fileExtension,
     previewForRow: previewForRow,
+    appCategoryLabel: appCategoryLabel,
     scopedSearchRows: scopedSearchRows,
     normalizeScopedResults: normalizeScopedResults,
     parentDirectory: parentDirectory,
