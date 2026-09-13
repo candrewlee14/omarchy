@@ -153,8 +153,12 @@ so a misspelling still attempts to open that id. Summoning a route that
 resolves to an action — an alias for a leaf, like `screenrecord-stop` — runs
 the action directly instead of opening an action with no children, and a
 link is followed to its target. The default Hyprland bindings in
-`default/hypr/bindings/utilities.lua` all go through this surface
-(SUPER+SPACE toggles root, SUPER+ESCAPE the system menu, and so on).
+`default/hypr/bindings/utilities.lua` use matching `GlobalShortcut`
+registrations in the already-running shell, avoiding the startup cost of a
+fresh `qs` IPC client on every keypress. The central shell owns those
+registrations and routes them through the plugin registry, so replacing
+`omarchy.menu` still works. `omarchy-menu` remains the equivalent IPC surface
+for scripts and terminals.
 
 ## Select and input modes
 

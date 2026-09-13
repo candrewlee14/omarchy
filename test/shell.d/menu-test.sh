@@ -10,6 +10,8 @@ const menu = requireFromRoot('shell/plugins/menu/MenuModel.js')
 const menuQml = fs.readFileSync(path.join(root, 'shell/plugins/menu/Menu.qml'), 'utf8')
 const scopeSearchQml = fs.readFileSync(path.join(root, 'shell/plugins/menu/ScopeSearchController.qml'), 'utf8')
 const defaultMenuJsonc = fs.readFileSync(path.join(root, 'default/omarchy/omarchy-menu.jsonc'), 'utf8')
+const shellQml = fs.readFileSync(path.join(root, 'shell/shell.qml'), 'utf8')
+const utilitiesLua = fs.readFileSync(path.join(root, 'default/hypr/bindings/utilities.lua'), 'utf8')
 
 const parsed = menu.parseMenuJsonc(`
 {
@@ -128,6 +130,9 @@ assertDeepEqual(
   'menu builds display rows'
 )
 
+assert(shellQml.includes('delegate: GlobalShortcut {'), 'shell registers menu hotkeys in the persistent process')
+assert(shellQml.includes('shell.toggle("omarchy.menu", JSON.stringify({ menu: modelData.route }))'), 'global menu hotkeys still resolve plugin replacements centrally')
+assert(utilitiesLua.includes('hl.dsp.global("omarchy:menu-root")'), 'Super+Space bypasses per-invocation shell IPC startup')
 const defaultItems = menu.parseMenuJsonc(defaultMenuJsonc)
 const defaultById = Object.fromEntries(defaultItems.map(item => [item.id, item]))
 
