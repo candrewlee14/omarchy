@@ -8,9 +8,10 @@ and `test/shell.d/activity-test.sh` for the contract.
 
 ## Schema
 
-- `items(kind, target, title, bonus, PRIMARY KEY (kind, target))` — one row per rankable thing, strictly namespaced by `kind` so identical target names never collide across categories.
+- `items(kind, target, title, bonus, icon, icon_font, detail, action, PRIMARY KEY (kind, target))` — one row per rankable thing, strictly namespaced by `kind` so identical target names never collide across categories.
 - `visits(kind, target, at, via)` — one row per use, `at` in epoch milliseconds, capped at the 10 newest per item. `via` is `pick` (explicit choice) or `view` (passive sighting, e.g. a window opening).
-- Indexed with `idx_visits_lookup(kind, target, at DESC)`, `idx_visits_at(at)`, and `idx_items_kind_target(kind, target)`. Stale pruning uses an $O(1)$ index probe to bypass full-table scans when no stale visits exist.
+- `items_fts(kind, target, title, detail)` — an external-content FTS5 index maintained by triggers, with Porter stemming and prefix search.
+- Indexed with `idx_visits_lookup(kind, target, at DESC)`, `idx_visits_at(at)`, and `idx_items_target(target)`. Stale pruning uses an $O(1)$ index probe to bypass full-table scans when no stale visits exist.
 
 ## Vocabulary
 
@@ -19,8 +20,7 @@ and `test/shell.d/activity-test.sh` for the contract.
   (working directories from agents / zoxide), `agent-session` (coding agent
   session IDs). New consumers add arbitrary kinds; ranking stays per-kind unless
   a consumer blends.
-- `via` separates provenance. `top` ranks picks by default; views accumulate
-  history for future blending without outvoting picks today.
+- `via` separates provenance. Ranking blends picks and views by default, with views weighted at one quarter, so passive history cannot outvote deliberate choices.
 
 ## Scoring
 
@@ -54,6 +54,17 @@ omarchy-activity record app "$app_id" "$label" >/dev/null 2>&1 || true
 omarchy-activity top --kind app  # {target: {count, lastUsed, score}}
 ```
 
+Large scoped collections use FTS without hydrating the entire collection. The normal form returns one JSON array; `--stream` emits versioned NDJSON `rows` batches of up to eight results and a final `done` event for responsive UI consumers. `--query-id` supplies a correlation value on every event, and a failed search emits a terminal `error` event and exits nonzero:
+
+```bash
+omarchy-activity search "database refactor" --kind agent-session --limit 15
+omarchy-activity search "database refactor" --kind agent-session --limit 15 --stream --query-id example-1
+```
+
+Long-running consumers can use `search --worker`. It accepts one versioned JSON request per stdin line and emits the same correlated event stream, retaining its read-only SQLite connection between requests. The menu uses this mode to avoid process startup during a typing burst, then stops the worker after five idle seconds or immediately when the menu closes.
+
+Search opens the existing database read-only and does not run schema migrations or other DDL on the per-query hot path. It merges bounded FTS-prefix and infix candidate sets so a valid substring does not disappear merely because FTS found another row. Results rank pins first, then match tier and textual relevance, blended frecency, recency, and a deterministic title/target tie-break. Frecency remains derived from the capped visit history rather than denormalized: its age-bucket score changes with time, so persisting the computed score would require a refresh job and risk stale ordering.
+
 ```bash
 printf '%s\n' "$files" | omarchy-activity rank --kind file  # scored first, stable rest
 # or legacy alias:
@@ -74,7 +85,7 @@ Any external CLI, script, or plugin can record and rank its own data structures:
 
 ### 1. Seeding External Tools
 - **Zoxide**: `omarchy-activity import-zoxide [file]` imports directory history into `kind='project'`, weighting visits by zoxide score.
-- **Coding Agents**: `omarchy-activity import-agents` scans Antigravity and Codex history to seed active workspaces (`kind='project'`) and session titles (`kind='agent-session'`).
+- **Coding Agents**: `omarchy-activity import-agents` scans Antigravity, Codex, Claude, and OpenCode history to seed active workspaces (`kind='project'`) and session titles (`kind='agent-session'`).
 - **Gtk Recents**: `omarchy-activity import-xbel [file]` seeds GTK recent files (`kind='file'`).
 
 ### 2. Custom Pipelines

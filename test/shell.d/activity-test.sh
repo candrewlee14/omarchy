@@ -247,7 +247,7 @@ jq -e '.["/tmp/zo-high"].count == 10 and .["/tmp/zo-low"].count == 2' <<<"$zo_to
 pass "activity import-zoxide seeds visits matching score"
 
 # import-agents seeds workspaces and sessions from Antigravity and Codex
-mkdir -p "$test_tmp/ag" "$test_tmp/.codex"
+mkdir -p "$test_tmp/ag" "$test_tmp/.codex" "$test_tmp/.claude/projects/demo"
 cat >"$test_tmp/ag/history.jsonl" <<'EOF'
 {"display": "Refactor database queries\nDetails here", "timestamp": 1788730000000, "workspace": "/tmp/ag-work", "conversationId": "ag-sess-1"}
 EOF
@@ -258,9 +258,12 @@ cat >"$test_tmp/.codex/config.toml" <<'EOF'
 [projects."/tmp/codex-work"]
 trust_level = "trusted"
 EOF
+cat >"$test_tmp/.claude/projects/demo/claude-sess-1.jsonl" <<'EOF'
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Review the streaming search pipeline"}]}}
+EOF
 
 agent_out=$("$activity" import-agents --antigravity "$test_tmp/ag/history.jsonl" --codex "$test_tmp/.codex/session_index.jsonl")
-[[ $agent_out =~ "imported 2 projects and 2 agent sessions" ]] ||
+[[ $agent_out =~ "imported 2 projects and 3 agent sessions" ]] ||
   fail "activity import-agents reports imported counts" "$agent_out"
 pass "activity import-agents reports imported counts"
 
@@ -270,7 +273,7 @@ jq -e 'has("/tmp/ag-work") and has("/tmp/codex-work")' <<<"$ag_proj" >/dev/null 
 pass "activity import-agents seeds projects"
 
 ag_sess=$("$activity" top --kind agent-session --via all)
-jq -e 'has("ag-sess-1") and has("codex-sess-1")' <<<"$ag_sess" >/dev/null ||
+jq -e 'has("ag-sess-1") and has("codex-sess-1") and .["claude-sess-1"].title == "Review the streaming search pipeline"' <<<"$ag_sess" >/dev/null ||
   fail "activity import-agents seeds sessions" "$ag_sess"
 pass "activity import-agents seeds sessions"
 
@@ -290,3 +293,98 @@ jq -e 'length == 0' <<<"$search_empty" >/dev/null ||
   fail "activity search returns empty array for no match" "$search_empty"
 pass "activity search returns empty array for no match"
 
+# BM25 weights correspond to kind, target, title, detail respectively. A title
+# hit must outrank the same token appearing only in a target.
+"$activity" record agent-session "needle-target" "Ordinary session" >/dev/null
+"$activity" record agent-session "title-match" "Needle in the title" >/dev/null
+weighted_search=$("$activity" search needle --kind agent-session)
+[[ $(jq -r '.[0].target' <<<"$weighted_search") == "title-match" ]] ||
+  fail "activity search weights titles above targets" "$weighted_search"
+pass "activity search weights titles above targets"
+
+# Pins retain their promise to float above scored results, including FTS.
+"$activity" pin needle-target --kind agent-session >/dev/null
+pinned_search=$("$activity" search needle --kind agent-session)
+[[ $(jq -r '.[0].target' <<<"$pinned_search") == "needle-target" ]] ||
+  fail "activity search keeps pinned matches first" "$pinned_search"
+pass "activity search keeps pinned matches first"
+
+# Infix candidates complement FTS instead of disappearing as soon as any FTS
+# row exists. "middlehit" is embedded inside a token and is not an FTS prefix.
+"$activity" record agent-session fts-prefix "Alpha result" >/dev/null
+"$activity" record agent-session infix-only "xxalphayy middlehit" >/dev/null
+merged_search=$("$activity" search alpha --kind agent-session --limit 15)
+jq -e 'map(.target) | index("fts-prefix") != null and index("infix-only") != null' <<<"$merged_search" >/dev/null ||
+  fail "activity search merges FTS and infix candidates" "$merged_search"
+pass "activity search merges FTS and infix candidates"
+
+# Equal text/global activity can still learn which result wins for one exact
+# query. Stored query keys are fingerprints, not plaintext search terms.
+"$activity" record agent-session affinity-a "Affinity result A" >/dev/null
+"$activity" record agent-session affinity-b "Affinity result B" --query affinity >/dev/null
+sqlite3 "$HOME/.local/share/omarchy/activity.db" "DELETE FROM visits WHERE kind = 'agent-session' AND target IN ('affinity-a', 'affinity-b'); INSERT INTO visits(kind,target,at,via) VALUES('agent-session','affinity-a',1800000000000,'pick'),('agent-session','affinity-b',1800000000000,'pick');"
+affinity_search=$("$activity" search affinity --kind agent-session --limit 2)
+[[ $(jq -r '.[0].target' <<<"$affinity_search") == "affinity-b" ]] ||
+  fail "activity search learns the selected target for an exact query" "$affinity_search"
+query_choice=$(sqlite3 -separator '|' "$HOME/.local/share/omarchy/activity.db" "SELECT query_hash, count FROM query_choices WHERE kind = 'agent-session' AND target = 'affinity-b'")
+[[ $query_choice =~ ^[0-9a-f]{64}\|1$ && $query_choice != *affinity* ]] ||
+  fail "activity query learning stores a bounded fingerprint" "$query_choice"
+pass "activity search learns query affinity without storing plaintext"
+
+# The launcher protocol yields bounded NDJSON batches followed by a terminal
+# event, while the default CLI contract remains a JSON array.
+for i in $(seq 1 11); do
+  "$activity" record agent-session "batch-$i" "Batchtoken result $i" >/dev/null
+done
+stream_search=$("$activity" search batchtoken --kind agent-session --limit 11 --stream --query-id batch-query)
+jq -se 'length == 3 and .[-1].type == "done" and (all(.[]; .version == 1 and .source == "activity" and .queryId == "batch-query")) and ([.[] | select(.type == "rows") | (.rows | length)] | add) == 11 and ([.[] | select(.type == "rows") | (.rows | length <= 8)] | all)' <<<"$stream_search" >/dev/null ||
+  fail "activity search streams bounded result batches" "$stream_search"
+pass "activity search streams bounded result batches"
+
+empty_stream=$("$activity" search nonexistentterm999 --kind agent-session --stream)
+jq -se 'length == 1 and .[0].type == "done" and .[0].version == 1' <<<"$empty_stream" >/dev/null ||
+  fail "activity streaming search terminates empty results" "$empty_stream"
+pass "activity streaming search terminates empty results"
+
+# The persistent worker accepts multiple versioned requests on one process and
+# correlates every event, including a terminal protocol error.
+worker_search=$({
+  printf '%s\n' '{"version":1,"queryId":"first","query":"batchtoken","kind":"agent-session","limit":2}'
+  sleep 0.2
+  printf '%s\n' '{"version":1,"queryId":"second","query":"nonexistentterm999","kind":"agent-session","limit":2}'
+  sleep 0.2
+  printf '%s\n' '{"version":99,"queryId":"bad","query":"batchtoken"}'
+} |
+  "$activity" search --worker)
+jq -se '([.[] | select(.queryId == "first" and .type == "rows") | .rows[]] | length) == 2 and (any(.[]; .queryId == "first" and .type == "done")) and (any(.[]; .queryId == "second" and .type == "done")) and (any(.[]; .queryId == "bad" and .type == "error"))' <<<"$worker_search" >/dev/null ||
+  fail "activity persistent search worker serves and correlates requests" "$worker_search"
+pass "activity persistent search worker serves and correlates requests"
+
+coalesced_search=$({
+  for i in $(seq 1 20); do
+    printf '{"version":1,"queryId":"burst-%s","query":"batchtoken","kind":"agent-session","limit":2}\n' "$i"
+  done
+} | "$activity" search --worker)
+jq -se 'any(.[]; .queryId == "burst-20" and .type == "done") and ([.[] | select(.type == "done")] | length) < 20' <<<"$coalesced_search" >/dev/null ||
+  fail "activity search worker coalesces superseded bursts" "$coalesced_search"
+pass "activity search worker coalesces superseded bursts"
+
+broken_home="$test_tmp/broken-home"
+mkdir -p "$broken_home/.local/share/omarchy"
+printf 'not sqlite\n' >"$broken_home/.local/share/omarchy/activity.db"
+if broken_search=$(HOME="$broken_home" "$activity" search anything --stream --query-id broken 2>/dev/null); then
+  fail "activity streaming search returns failure for an unreadable database" "$broken_search"
+fi
+jq -se 'length == 1 and .[0].type == "error" and .[0].queryId == "broken"' <<<"$broken_search" >/dev/null ||
+  fail "activity streaming search emits a terminal error event" "$broken_search"
+pass "activity streaming search emits terminal errors"
+
+# Searching is read-only after initialization, so a locked-down database
+# directory does not turn every keystroke into a failed migration attempt.
+activity_dir="$HOME/.local/share/omarchy"
+chmod 500 "$activity_dir"
+readonly_search=$("$activity" search batchtoken --kind agent-session --limit 1)
+chmod 700 "$activity_dir"
+jq -e 'length == 1' <<<"$readonly_search" >/dev/null ||
+  fail "activity search uses a read-only hot path" "$readonly_search"
+pass "activity search uses a read-only hot path"

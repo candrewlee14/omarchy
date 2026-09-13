@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 # omarchy:summary=Record and read shared usage frecency
-# omarchy:args=(record <kind> <target> [title] [--via pick|view] | top [--kind <kind>] [--via pick|view|all] [--limit <n>] | search <query> [--kind <kind>] [--limit <n>] | rank [--kind <kind>] [--via pick|view|all] [--limit <n>] | rank-files [--via pick|view|all] [--limit <n>] | forget <target> [--kind <kind>] | pin <target> [--kind <kind>] | unpin <target> [--kind <kind>] | stats | import-frecency <file> | import-xbel [file] | import-zoxide [file] | import-agents)
+# omarchy:args=(record <kind> <target> [title] [--via pick|view] [--query <query>] | top [--kind <kind>] [--via pick|view|all] [--limit <n>] | search [<query>] [--kind <kind>] [--limit <n>] [--stream] [--query-id <id>] [--worker] | rank [--kind <kind>] [--via pick|view|all] [--limit <n>] | rank-files [--via pick|view|all] [--limit <n>] | forget <target> [--kind <kind>] | pin <target> [--kind <kind>] | unpin <target> [--kind <kind>] | stats | import-frecency <file> | import-xbel [file] | import-zoxide [file] | import-agents)
 # omarchy:examples=omarchy activity record app firefox | omarchy activity top --kind app | omarchy activity rank --kind project
 """Shared usage journal for the shell.
 
@@ -11,17 +11,22 @@ recent visits, so ranking weighs frequency and recency together.
 
 Writes are single short transactions (WAL + busy timeout, three attempts on
 a locked database) because recorders fire and forget; reads hydrate the
-caller's in-memory map once instead of running per keystroke.
+caller's common-item cache once, while large scoped collections use the
+read-only FTS search path without rerunning schema setup per keystroke.
 """
 
 import argparse
+import hashlib
 import json
 import os
+import queue
 import re
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 DB_RELATIVE = Path(".local/share/omarchy/activity.db")
 MAX_VISITS_PER_TARGET = 10
@@ -39,6 +44,9 @@ BUCKET_DEFAULT_WEIGHT = 10
 # Passive sightings count toward the blended score at this fraction of an
 # explicit pick: history accumulates from views, decisions come from picks.
 VIEW_WEIGHT = 0.25
+SEARCH_PROTOCOL_VERSION = 1
+SEARCH_BATCH_SIZE = 8
+MAX_QUERY_CHOICES_PER_TARGET = 50
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items(
@@ -61,6 +69,15 @@ CREATE TABLE IF NOT EXISTS visits(
 );
 CREATE INDEX IF NOT EXISTS idx_visits_lookup ON visits(kind, target, at DESC);
 CREATE INDEX IF NOT EXISTS idx_visits_at ON visits(at);
+CREATE TABLE IF NOT EXISTS query_choices(
+  kind TEXT NOT NULL,
+  query_hash TEXT NOT NULL,
+  target TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 1,
+  last_used INTEGER NOT NULL,
+  PRIMARY KEY (kind, query_hash, target)
+);
+CREATE INDEX IF NOT EXISTS idx_query_choices_target ON query_choices(kind, target, last_used DESC);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS items_fts USING fts5(
   kind UNINDEXED,
@@ -136,13 +153,33 @@ def connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def bucket_weight_case(now_ms: int) -> str:
+def connect_search(path: Path) -> sqlite3.Connection | None:
+    """Open the activity database without running migrations on the search hot path."""
+    if not path.exists():
+        return None
+    uri = f"file:{quote(str(path))}?mode=ro"
+    # interrupt() is intentionally called by the worker's stdin thread when a
+    # newer request supersedes active SQL.
+    conn = sqlite3.connect(uri, uri=True, timeout=0.25, check_same_thread=False)
+    conn.execute("PRAGMA query_only=ON")
+    conn.execute("PRAGMA busy_timeout=250")
+    conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA mmap_size=33554432")
+    return conn
+
+
+def bucket_weight_case(now_ms: int, at_column: str = "at") -> str:
     """SQL CASE returning a visit's bucket weight for its age in ms."""
     arms = " ".join(
-        f"WHEN ({now_ms} - at) <= {days * MS_PER_DAY} THEN {weight}"
+        f"WHEN ({now_ms} - {at_column}) <= {days * MS_PER_DAY} THEN {weight}"
         for days, weight in BUCKET_WEIGHTS
     )
     return f"CASE {arms} ELSE {BUCKET_DEFAULT_WEIGHT} END"
+
+
+def query_fingerprint(query: str) -> str:
+    normalized = " ".join(re.findall(r"\w+", query.casefold()))
+    return hashlib.sha256(normalized.encode()).hexdigest() if normalized else ""
 
 
 def prune_stale(conn: sqlite3.Connection, now_ms: int) -> None:
@@ -193,6 +230,18 @@ def cmd_record(args) -> int:
                     "(SELECT rowid FROM visits WHERE kind = ? AND target = ? ORDER BY at DESC LIMIT ?)",
                     (args.kind, args.target, args.kind, args.target, MAX_VISITS_PER_TARGET),
                 )
+                query_hash = query_fingerprint(getattr(args, "query", "") or "")
+                if query_hash:
+                    conn.execute(
+                        "INSERT INTO query_choices(kind, query_hash, target, count, last_used) VALUES(?, ?, ?, 1, ?) "
+                        "ON CONFLICT(kind, query_hash, target) DO UPDATE SET count = count + 1, last_used = excluded.last_used",
+                        (args.kind, query_hash, args.target, now_ms),
+                    )
+                    conn.execute(
+                        "DELETE FROM query_choices WHERE kind = ? AND target = ? AND query_hash NOT IN "
+                        "(SELECT query_hash FROM query_choices WHERE kind = ? AND target = ? ORDER BY last_used DESC LIMIT ?)",
+                        (args.kind, args.target, args.kind, args.target, MAX_QUERY_CHOICES_PER_TARGET),
+                    )
                 prune_stale(conn, now_ms)
             return 0
         except sqlite3.OperationalError as e:
@@ -257,76 +306,141 @@ def cmd_top(args) -> int:
     return 0
 
 
-def cmd_search(args) -> int:
-    query = getattr(args, "query", "") or ""
-    kind = getattr(args, "kind", "") or ""
-    limit = getattr(args, "limit", 15) or 15
+def search_event(event_type: str, query_id: str, **payload) -> dict:
+    return {
+        "version": SEARCH_PROTOCOL_VERSION,
+        "source": "activity",
+        "queryId": str(query_id),
+        "type": event_type,
+        **payload,
+    }
+
+
+def search_rows(query: str, kind: str, limit: int, conn: sqlite3.Connection | None = None) -> list[dict]:
+    """Return globally ranked FTS and infix candidates for one scoped query."""
     words = re.findall(r"\w+", query)
     if not words:
-        print("[]")
-        return 0
+        return []
+
+    owns_conn = conn is None
+    if conn is None:
+        conn = connect_search(db_path())
+    if conn is None:
+        return []
+    conn.row_factory = sqlite3.Row
+    has_query_choices = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'query_choices'"
+    ).fetchone() is not None
+    query_score = (
+        "COALESCE((SELECT count FROM query_choices qc WHERE qc.kind = i.kind "
+        "AND qc.query_hash = ? AND qc.target = i.target), 0)"
+        if has_query_choices else "0"
+    )
 
     fts_q = " AND ".join(f'"{w}"*' for w in words)
     where = ["items_fts MATCH ?"]
-    params = [fts_q]
+    query_hash = query_fingerprint(query)
+    params = ([query_hash] if has_query_choices else []) + [fts_q]
     if kind:
         where.append("i.kind = ?")
         params.append(kind)
 
-    # Weighted bm25 scoring: rank title matches (10.0) well above detail (1.5) and target (0.5).
-    # Correlated scalar subquery avoids grouping over high-cardinality visits,
-    # resolving latest visit in a single index probe against idx_visits_lookup.
+    now_ms = int(time.time() * 1000)
+    visit_weight = bucket_weight_case(now_ms, "v.at")
+    blended_visit_weight = f"CASE WHEN v.via = 'pick' THEN {visit_weight} ELSE {VIEW_WEIGHT} * ({visit_weight}) END"
+    frecency = (
+        "COALESCE((SELECT SUM(" + blended_visit_weight + ") FROM visits v "
+        "WHERE v.kind = i.kind AND v.target = i.target), 0) + i.bonus"
+    )
+    # FTS has four columns, including the UNINDEXED kind column. BM25 weights
+    # are positional even for UNINDEXED columns, so the leading zero matters:
+    # title matches rank well above detail and target matches.
     sql = f"""
     SELECT i.target, i.kind, i.title, i.icon, i.icon_font, i.detail, i.action,
-           bm25(items_fts, 0.5, 10.0, 1.5) AS score,
+           bm25(items_fts, 0.0, 0.5, 10.0, 1.5) AS score,
+           i.bonus,
+           {query_score} AS query_score,
+           {frecency} AS frecency,
            (SELECT at FROM visits WHERE kind = i.kind AND target = i.target ORDER BY at DESC LIMIT 1) AS last_used
     FROM items_fts f
     JOIN items i ON i.rowid = f.rowid
     WHERE {' AND '.join(where)}
-    ORDER BY score ASC, last_used DESC
+    ORDER BY i.bonus DESC, score ASC, query_score DESC, frecency DESC, last_used DESC, i.title COLLATE NOCASE, i.target
     LIMIT ?
     """
-    params.append(limit)
-
+    # Pull a bounded relevance set from each matcher, then merge and apply the
+    # global pin/relevance/frecency order. This preserves useful infix matches
+    # even when FTS also found rows, without materializing an unbounded result.
+    candidate_limit = max(limit * 3, limit)
+    params.append(candidate_limit)
+    candidates: dict[tuple[str, str], tuple[sqlite3.Row, int]] = {}
+    fts_error = None
+    like_error = None
     try:
-        with connect(db_path()) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(sql, params).fetchall()
-    except sqlite3.Error:
-        rows = []
+        for row in conn.execute(sql, params):
+            candidates[(row["kind"], row["target"])] = (row, 0)
+    except sqlite3.Error as error:
+        fts_error = error
 
-    if not rows and words:
-        like_clauses = ["(i.title LIKE ? OR i.detail LIKE ? OR i.target LIKE ?)" for _ in words]
-        like_params = []
-        for w in words:
-            p = f"%{w}%"
-            like_params.extend([p, p, p])
-        if kind:
-            like_clauses.append("i.kind = ?")
-            like_params.append(kind)
-        like_params.append(limit)
-        fallback_sql = f"""
+    like_clauses = ["(i.title LIKE ? OR i.detail LIKE ? OR i.target LIKE ?)" for _ in words]
+    like_params = []
+    for word in words:
+        pattern = f"%{word}%"
+        like_params.extend([pattern, pattern, pattern])
+    if kind:
+        like_clauses.append("i.kind = ?")
+        like_params.append(kind)
+    # Ordinary infix matches rank after every FTS match, so a full substring
+    # scan cannot affect a filled result page. Pinned infix matches are the
+    # exception and are cheap to check independently.
+    include_all_infix = len(candidates) < limit
+    if not include_all_infix:
+        like_clauses.append("i.bonus > 0")
+    like_params.append(candidate_limit if include_all_infix else limit)
+    like_sql = f"""
         SELECT i.target, i.kind, i.title, i.icon, i.icon_font, i.detail, i.action,
                0 AS score,
+               i.bonus,
+               {query_score} AS query_score,
+               {frecency} AS frecency,
                (SELECT at FROM visits WHERE kind = i.kind AND target = i.target ORDER BY at DESC LIMIT 1) AS last_used,
                (SELECT COUNT(at) FROM visits WHERE kind = i.kind AND target = i.target) AS uses
         FROM items i
         WHERE {' AND '.join(like_clauses)}
-        ORDER BY last_used DESC, uses DESC
+        ORDER BY i.bonus DESC, query_score DESC, frecency DESC, last_used DESC, uses DESC, i.title COLLATE NOCASE, i.target
         LIMIT ?
-        """
-        try:
-            with connect(db_path()) as conn:
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute(fallback_sql, like_params).fetchall()
-        except sqlite3.Error:
-            rows = []
+    """
+    if has_query_choices:
+        like_params.insert(0, query_hash)
+    try:
+        for row in conn.execute(like_sql, like_params):
+            candidates.setdefault((row["kind"], row["target"]), (row, 1))
+    except sqlite3.Error as error:
+        like_error = error
 
+    if owns_conn:
+        conn.close()
+    if fts_error is not None and like_error is not None:
+        raise sqlite3.OperationalError(f"FTS search failed: {fts_error}; infix search failed: {like_error}")
+
+    ranked = sorted(
+        candidates.values(),
+        key=lambda candidate: (
+            -candidate[0]["bonus"],
+            candidate[1],
+            float(candidate[0]["score"] or 0.0) if candidate[1] == 0 else 0.0,
+            -int(candidate[0]["query_score"] or 0),
+            -float(candidate[0]["frecency"] or 0.0),
+            -int(candidate[0]["last_used"] or 0),
+            (candidate[0]["title"] or "").casefold(),
+            candidate[0]["target"],
+        ),
+    )[:limit]
     results = []
-    for r in rows:
+    for r, _match_tier in ranked:
         rk = r["kind"]
         rt = r["target"]
-        results.append({
+        result = {
             "itemId": f"{rk}.{rt}",
             "disabled": False,
             "kind": rk,
@@ -343,8 +457,106 @@ def cmd_search(args) -> int:
             "provider": "",
             "score": float(r["score"]) if r["score"] is not None else 0.0,
             "section": "",
-        })
-    print(json.dumps(results))
+        }
+        results.append(result)
+    return results
+
+
+def emit_search(rows: list[dict], query_id: str) -> None:
+    for offset in range(0, len(rows), SEARCH_BATCH_SIZE):
+        print(json.dumps(search_event("rows", query_id, rows=rows[offset:offset + SEARCH_BATCH_SIZE])), flush=True)
+    print(json.dumps(search_event("done", query_id)), flush=True)
+
+
+def cmd_search_worker() -> int:
+    """Serve only the latest NDJSON request, interrupting superseded SQL."""
+    requests: queue.Queue = queue.Queue(maxsize=1)
+    state = {"conn": None, "sequence": 0}
+    state_lock = threading.Lock()
+
+    def read_requests() -> None:
+        for line in sys.stdin:
+            with state_lock:
+                state["sequence"] += 1
+                sequence = state["sequence"]
+                active_conn = state["conn"]
+                if active_conn is not None:
+                    active_conn.interrupt()
+            try:
+                requests.get_nowait()
+            except queue.Empty:
+                pass
+            requests.put((sequence, line))
+        requests.put(None)
+
+    reader = threading.Thread(target=read_requests, name="activity-search-input", daemon=True)
+    reader.start()
+    conn = None
+    while True:
+        queued = requests.get()
+        if queued is None:
+            break
+        sequence, line = queued
+        query_id = ""
+        try:
+            request = json.loads(line)
+            if not isinstance(request, dict):
+                raise ValueError("search request must be an object")
+            query_id = str(request.get("queryId", ""))
+            if request.get("version") != SEARCH_PROTOCOL_VERSION:
+                raise ValueError("unsupported search request")
+            query = str(request.get("query", ""))
+            kind = str(request.get("kind", ""))
+            limit = max(1, min(int(request.get("limit", 15)), 1000))
+            if conn is None:
+                conn = connect_search(db_path())
+                with state_lock:
+                    state["conn"] = conn
+            rows = search_rows(query, kind, limit, conn)
+        except (ValueError, TypeError, json.JSONDecodeError, sqlite3.Error) as error:
+            with state_lock:
+                superseded = state["sequence"] > sequence
+            interrupted = isinstance(error, sqlite3.OperationalError) and "interrupt" in str(error).lower()
+            if conn is not None and not (superseded and interrupted):
+                with state_lock:
+                    state["conn"] = None
+                    conn.close()
+                    conn = None
+            if superseded:
+                continue
+            print(json.dumps(search_event("error", query_id, message=str(error))), flush=True)
+            continue
+
+        with state_lock:
+            superseded = state["sequence"] > sequence
+        if not superseded:
+            emit_search(rows, query_id)
+    if conn is not None:
+        with state_lock:
+            state["conn"] = None
+            conn.close()
+    reader.join(timeout=0.1)
+    return 0
+
+
+def cmd_search(args) -> int:
+    if args.worker:
+        return cmd_search_worker()
+
+    query_id = getattr(args, "query_id", "") or ""
+    try:
+        results = search_rows(args.query or "", args.kind or "", max(1, args.limit or 15))
+    except sqlite3.Error as error:
+        if args.stream:
+            print(json.dumps(search_event("error", query_id, message=str(error))), flush=True)
+        else:
+            print(f"omarchy-activity: search error: {error}", file=sys.stderr)
+        return 1
+
+    if args.stream:
+        emit_search(results, query_id)
+    else:
+        print(json.dumps(results))
     return 0
 
 
@@ -390,9 +602,11 @@ def cmd_forget(args) -> int:
     with connect(db_path()) as conn:
         if getattr(args, "kind", None) and args.kind:
             conn.execute("DELETE FROM visits WHERE kind = ? AND target = ?", (args.kind, args.target))
+            conn.execute("DELETE FROM query_choices WHERE kind = ? AND target = ?", (args.kind, args.target))
             conn.execute("DELETE FROM items WHERE kind = ? AND target = ?", (args.kind, args.target))
         else:
             conn.execute("DELETE FROM visits WHERE target = ?", (args.target,))
+            conn.execute("DELETE FROM query_choices WHERE target = ?", (args.target,))
             conn.execute("DELETE FROM items WHERE target = ?", (args.target,))
     print(f"forgot {args.target}")
     return 0
@@ -493,9 +707,9 @@ def cmd_import_xbel(args) -> int:
     with connect(db_path()) as conn:
         for target, at in seen.items():
             conn.execute(
-                "INSERT INTO items(kind, target, title) VALUES('file', ?, ?) "
-                "ON CONFLICT(kind, target) DO NOTHING",
-                (target, Path(target).name),
+                "INSERT INTO items(kind, target, title, detail, icon) VALUES('file', ?, ?, ?, '') "
+                "ON CONFLICT(kind, target) DO UPDATE SET title = excluded.title, detail = excluded.detail, icon = ''",
+                (target, Path(target).name, str(Path(target).parent)),
             )
             if conn.execute(
                 "SELECT COUNT(*) FROM visits WHERE kind = 'file' AND target = ?", (target,)
@@ -593,9 +807,9 @@ def cmd_import_zoxide(args) -> int:
             target = os.path.abspath(os.path.expanduser(path_str))
             title = Path(target).name or target
             conn.execute(
-                "INSERT INTO items(kind, target, title) VALUES('project', ?, ?) "
-                "ON CONFLICT(kind, target) DO NOTHING",
-                (target, title),
+                "INSERT INTO items(kind, target, title, detail, icon) VALUES('project', ?, ?, ?, '') "
+                "ON CONFLICT(kind, target) DO UPDATE SET title = excluded.title, detail = excluded.detail, icon = ''",
+                (target, title, target),
             )
             if conn.execute(
                 "SELECT COUNT(*) FROM visits WHERE kind = 'project' AND target = ?", (target,)
@@ -625,6 +839,17 @@ def cmd_import_agents(args) -> int:
 
     projects: dict[str, int] = {}
     sessions: dict[str, dict] = {}
+
+    def prompt_text(value) -> str:
+        """Extract readable prompt text from the common agent message shapes."""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            return prompt_text(value.get("content") or value.get("text") or "")
+        if isinstance(value, list):
+            parts = [prompt_text(part) for part in value]
+            return " ".join(part for part in parts if part)
+        return ""
 
     # 1. Parse Antigravity conversation summaries database if available
     ag_db_path = ag_path.parent / "conversation_summaries.db"
@@ -798,7 +1023,7 @@ def cmd_import_agents(args) -> int:
                                     continue
                                 obj = json.loads(line)
                                 if obj.get("type") == "user" or "prompt" in obj:
-                                    p = obj.get("prompt") or obj.get("message") or ""
+                                    p = prompt_text(obj.get("prompt") or obj.get("message") or "")
                                     if p:
                                         title = p.strip().splitlines()[0][:80]
                                         break
@@ -874,6 +1099,7 @@ def main(argv=None) -> int:
     record.add_argument("--icon-font", default="", help="optional icon font family")
     record.add_argument("--detail", default="", help="optional secondary text")
     record.add_argument("--action", default="", help="optional custom command template")
+    record.add_argument("--query", default="", help="optional search query to learn for this pick")
     record.set_defaults(func=cmd_record)
 
     top = sub.add_parser("top", help="print {target: {count, lastUsed, score}} as JSON")
@@ -884,9 +1110,12 @@ def main(argv=None) -> int:
     top.set_defaults(func=cmd_top)
 
     search = sub.add_parser("search", help="fast SQLite FTS5 search across indexed items")
-    search.add_argument("query", help="search terms")
+    search.add_argument("query", nargs="?", default="", help="search terms")
     search.add_argument("--kind", default="", help="optional namespace (e.g. agent-session, file, project)")
     search.add_argument("--limit", type=int, default=15)
+    search.add_argument("--stream", action="store_true", help="emit newline-delimited result batches")
+    search.add_argument("--query-id", default="", help="correlation id included in stream events")
+    search.add_argument("--worker", action="store_true", help="serve versioned NDJSON search requests on stdin")
     search.set_defaults(func=cmd_search)
 
     rank = sub.add_parser("rank", help="sort stdin lines by item score")
