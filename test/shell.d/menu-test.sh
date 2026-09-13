@@ -8,6 +8,7 @@ run_node_test <<'JS'
 const fs = require('fs')
 const menu = requireFromRoot('shell/plugins/menu/MenuModel.js')
 const menuQml = fs.readFileSync(path.join(root, 'shell/plugins/menu/Menu.qml'), 'utf8')
+const actionPanelQml = fs.readFileSync(path.join(root, 'shell/plugins/menu/ActionPanel.qml'), 'utf8')
 const scopeSearchQml = fs.readFileSync(path.join(root, 'shell/plugins/menu/ScopeSearchController.qml'), 'utf8')
 const defaultMenuJsonc = fs.readFileSync(path.join(root, 'default/omarchy/omarchy-menu.jsonc'), 'utf8')
 const shellQml = fs.readFileSync(path.join(root, 'shell/shell.qml'), 'utf8')
@@ -133,6 +134,30 @@ assertDeepEqual(
 assert(shellQml.includes('delegate: GlobalShortcut {'), 'shell registers menu hotkeys in the persistent process')
 assert(shellQml.includes('shell.toggle("omarchy.menu", JSON.stringify({ menu: modelData.route }))'), 'global menu hotkeys still resolve plugin replacements centrally')
 assert(utilitiesLua.includes('hl.dsp.global("omarchy:menu-root")'), 'Super+Space bypasses per-invocation shell IPC startup')
+assertEqual(menu.parentDirectory('/home/user/file.txt'), '/home/user', 'menu finds a file containing folder')
+assertEqual(menu.parentDirectory('/home/user/project/'), '/home/user', 'menu finds a project containing folder')
+assertEqual(menu.parentDirectory('/file.txt'), '/', 'menu keeps a root-level file in root')
+assertDeepEqual(
+  menu.actionsForRow({ kind: 'file', target: '/tmp/readme', label: 'readme', disabled: false }).map(action => action.id),
+  ['primary', 'open-parent', 'copy-path', 'forget-recent'],
+  'file action panel offers open, reveal, copy, and forget'
+)
+assertDeepEqual(
+  menu.actionsForRow({ kind: 'agent-session', target: 'session-1', label: 'Session', disabled: false }).map(action => action.id),
+  ['primary', 'copy-session-id', 'forget-conversation'],
+  'conversation action panel offers resume, copy id, and forget'
+)
+assertDeepEqual(
+  menu.actionsForRow({ kind: 'app', appId: 'firefox', label: 'Firefox', disabled: false }).map(action => action.id),
+  ['primary', 'uninstall-app'],
+  'application action panel offers open and uninstall'
+)
+assertEqual(menu.actionsForRow({ kind: 'hint', disabled: true }).length, 0, 'action panel skips inert rows')
+assert(menuQml.includes('event.key === Qt.Key_K && (event.modifiers & Qt.ControlModifier)'), 'menu opens actions with Ctrl+K')
+assert(menuQml.includes('mouse.button === Qt.RightButton'), 'menu opens actions from a row context click')
+assertEqual(menu.actionsForRow({ kind: 'file' })[2].operation, 'copy-target', 'result actions separate stable operations from type-specific presentation')
+assert(actionPanelQml.includes('signal triggered(var action)'), 'action panel returns declarative action descriptors to the menu')
+
 const defaultItems = menu.parseMenuJsonc(defaultMenuJsonc)
 const defaultById = Object.fromEntries(defaultItems.map(item => [item.id, item]))
 
@@ -488,7 +513,7 @@ assert(
 )
 assert(
   /function selectFromPointer\(index, item, mouse\)[\s\S]*?if \(!root\.rowSelectable\(index\)\) return/.test(menuQml)
-    && /onClicked: \{\s*\n\s*if \(row\.disabled\) return/.test(menuQml),
+    && /onClicked: function\(mouse\) \{\s*\n\s*if \(row\.disabled\) return/.test(menuQml),
   'menu leaves the cursor put when the pointer crosses a disabled row'
 )
 assert(
