@@ -779,6 +779,59 @@ function normalizeScopedResults(rows, scopeKind, actionTemplate, fallbackIcon) {
   })
 }
 
+function parentDirectory(path) {
+  var value = String(path || "").replace(/\/+$/, "")
+  var slash = value.lastIndexOf("/")
+  if (slash <= 0) return "/"
+  return value.slice(0, slash)
+}
+
+var RESULT_ACTIONS = {
+  primary: { id: "primary", operation: "activate", icon: "󰌑", label: "Run Command", shortcut: "Enter" },
+  openParent: { id: "open-parent", operation: "open-parent", icon: "", label: "Open Containing Folder", shortcut: "" },
+  copyPath: { id: "copy-path", operation: "copy-target", icon: "", label: "Copy Path", shortcut: "" },
+  copySessionId: { id: "copy-session-id", operation: "copy-target", icon: "", label: "Copy Session ID", shortcut: "" },
+  forgetRecent: { id: "forget-recent", operation: "forget", icon: "󰆴", label: "Forget from Recents", shortcut: "", destructive: true },
+  forgetConversation: { id: "forget-conversation", operation: "forget", icon: "󰆴", label: "Forget Conversation", shortcut: "", destructive: true },
+  uninstallApp: { id: "uninstall-app", operation: "uninstall", icon: "󰆴", label: "Uninstall Application", shortcut: "", destructive: true }
+}
+
+var RESULT_ACTION_SETS = {
+  file: ["primary", "openParent", "copyPath", "forgetRecent"],
+  project: ["primary", "openParent", "copyPath", "forgetRecent"],
+  "agent-session": ["primary", "copySessionId", "forgetConversation"],
+  app: ["primary", "uninstallApp"]
+}
+
+var PRIMARY_ACTION_LABELS = {
+  app: "Open Application",
+  "agent-session": "Resume Conversation",
+  project: "Open Project",
+  file: "Open File",
+  calc: "Copy Result",
+  menu: "Open Menu",
+  link: "Open Menu"
+}
+
+function actionFromDefinition(name, kind) {
+  var definition = RESULT_ACTIONS[name]
+  if (!definition) return null
+  return {
+    id: definition.id,
+    operation: definition.operation,
+    icon: definition.icon,
+    label: name === "primary" ? (PRIMARY_ACTION_LABELS[kind] || definition.label) : definition.label,
+    shortcut: definition.shortcut,
+    destructive: definition.destructive === true
+  }
+}
+
+function actionsForRow(row) {
+  if (!row || row.disabled || row.kind === "hint") return []
+  var names = RESULT_ACTION_SETS[row.kind] || ["primary"]
+  return names.map(function(name) { return actionFromDefinition(name, row.kind) }).filter(function(action) { return action !== null })
+}
+
 // Pure state transition for the activity search protocol. Keeping validation
 // here makes stale/error/partial-result behavior testable outside QML.
 function reduceScopeSearchEvent(rows, started, event, queryId) {
@@ -971,6 +1024,8 @@ if (typeof module !== "undefined") {
     fileSearchRows: fileSearchRows,
     scopedSearchRows: scopedSearchRows,
     normalizeScopedResults: normalizeScopedResults,
+    parentDirectory: parentDirectory,
+    actionsForRow: actionsForRow,
     reduceScopeSearchEvent: reduceScopeSearchEvent,
     sessionSearchRows: sessionSearchRows,
     iconForFile: iconForFile,

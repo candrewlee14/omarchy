@@ -123,6 +123,7 @@ Item {
   onOpenedChanged: if (!opened) {
     deleteConfirmOpen = false
     deleteTarget = null
+    actionPanel.close()
     scopeSearch.shutdown()
   }
   // Bound to the central [menu] section in shell.toml via Color.qml.
@@ -1048,7 +1049,7 @@ Item {
   }
 
   function activateIndex(index, fromPointer) {
-    if (root.deleteConfirmOpen) return
+    if (root.deleteConfirmOpen || actionPanel.opened) return
     if (root.dmenuActive) {
       if (root.mode === "input") {
         if (root.inputForwardAction) {
@@ -1123,6 +1124,46 @@ Item {
       }
       root.recordFrecency("menu", row.itemId, row.label)
       root.applySelected(row.itemId, row.action)
+    }
+  }
+
+  function openActionPanel(index) {
+    if (root.dmenuActive || root.deleteConfirmOpen || index < 0 || index >= displayModel.count) return
+    var row = displayModel.get(index)
+    var actions = MenuModel.actionsForRow(row)
+    if (actions.length === 0) return
+    root.cursorActive = true
+    root.selectedIndex = index
+    root.disarmPointer()
+    actionPanel.openFor(row, actions)
+  }
+
+  function copyActionValue(value, description) {
+    var text = String(value || "")
+    if (!text) return
+    Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(text)
+      + " | wl-copy && omarchy-notification-send -g  " + Util.shellQuote(description || "Copied")])
+  }
+
+  function executePanelAction(action) {
+    var row = actionPanel.targetRow
+    actionPanel.close()
+    if (!row || !action || !action.operation) return
+
+    if (action.operation === "activate") {
+      root.activateIndex(root.selectedIndex)
+    } else if (action.operation === "open-parent") {
+      root.cancel()
+      root.runAction("xdg-open " + Util.shellQuote(MenuModel.parentDirectory(row.target)))
+    } else if (action.operation === "copy-target") {
+      root.copyActionValue(row.target, row.kind === "agent-session" ? "Session ID copied" : "Path copied")
+    } else if (action.operation === "forget") {
+      root.cancel()
+      Util.execDetached("omarchy-activity forget " + Util.shellQuote(row.target) + " --kind " + Util.shellQuote(row.kind))
+    } else if (action.operation === "uninstall" && row.kind === "app") {
+      root.deleteTarget = { appId: row.appId, label: row.label }
+      deleteConfirm.selectedIndex = 1
+      root.deleteConfirmOpen = true
     }
   }
 
@@ -1221,6 +1262,7 @@ Item {
       root.mode = "menu"
     }
     if (root.dmenuActive) root.finishRequest(null)
+    actionPanel.close()
     opened = false
     filterText = ""
   }
@@ -1639,11 +1681,15 @@ Item {
       Item {
         id: keyCatcher
         anchors.fill: parent
-        z: root.deleteConfirmOpen ? 20 : 0
+        z: root.deleteConfirmOpen || actionPanel.opened ? 20 : 0
         focus: true
 
         Keys.priority: Keys.BeforeItem
         Keys.onPressed: function(event) {
+          if (actionPanel.opened) {
+            if (actionPanel.handleKey(event)) event.accepted = true
+            return
+          }
           if (root.deleteConfirmOpen) {
             if (deleteConfirm.handleKey(event)) event.accepted = true
             return
@@ -1659,7 +1705,10 @@ Item {
             }
           }
 
-          if (event.key === Qt.Key_Delete) {
+          if (event.key === Qt.Key_K && (event.modifiers & Qt.ControlModifier)) {
+            root.openActionPanel(root.cursorActive ? root.selectedIndex : 0)
+            event.accepted = true
+          } else if (event.key === Qt.Key_Delete) {
             root.requestDeleteSelected()
             event.accepted = true
           } else if (event.key === Qt.Key_Escape) {
@@ -1726,6 +1775,21 @@ Item {
           cornerRadius: root.cornerRadius
           onCanceled: root.cancelDelete()
           onConfirmed: root.confirmDelete()
+        }
+
+        ActionPanel {
+          id: actionPanel
+          anchors.fill: parent
+          z: 9
+          background: root.background
+          foreground: root.foreground
+          scrim: root.scrim
+          selectedBackground: root.selectedBackground
+          selectedText: root.selectedText
+          fontFamily: root.fontFamily
+          cornerRadius: root.cornerRadius
+          onCanceled: actionPanel.close()
+          onTriggered: function(action) { root.executePanelAction(action) }
         }
       }
 
@@ -1932,6 +1996,7 @@ Item {
                 id: mouseArea
                 anchors.fill: parent
                 hoverEnabled: true
+                acceptedButtons: Qt.LeftButton | Qt.RightButton
                 cursorShape: row.disabled ? Qt.ArrowCursor : Qt.PointingHandCursor
                 onEntered: root.selectFromPointer(row.index, row, {
                   x: mouseArea.mouseX,
@@ -1940,11 +2005,12 @@ Item {
                 onPositionChanged: function(mouse) {
                   root.selectFromPointer(row.index, row, mouse)
                 }
-                onClicked: {
+                onClicked: function(mouse) {
                   if (row.disabled) return
                   root.cursorActive = true
                   root.selectedIndex = row.index
-                  root.activateIndex(row.index, true)
+                  if (mouse.button === Qt.RightButton) root.openActionPanel(row.index)
+                  else root.activateIndex(row.index, true)
                 }
               }
             }

@@ -160,6 +160,10 @@ registrations and routes them through the plugin registry, so replacing
 `omarchy.menu` still works. `omarchy-menu` remains the equivalent IPC surface
 for scripts and terminals.
 
+## Result actions
+
+Press `Ctrl+K` on a selected result, or right-click it, to open its action panel. The first row is the result's normal Enter behavior. Files and projects also expose their containing folder, path copying, and removal from activity history; agent conversations expose session-id copying and history removal; applications expose uninstall. `MenuModel.js` declares reusable action definitions and the ordered action set for each result kind. `ActionPanel.qml` only presents those descriptors, while `Menu.qml` executes their small, stable operation vocabulary. This keeps row-specific capabilities out of keyboard and pointer handlers and lets each kind grow multiple actions without another input-handler branch.
+
 ## Select and input modes
 
 The same plugin doubles as the system's dmenu. `omarchy-menu-select` and
