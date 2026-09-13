@@ -380,6 +380,11 @@ function damerauLevenshtein(a, b) {
   if (al === 0) return bl
   if (bl === 0) return al
   if (bl >= 63) return 99
+  // Typo matching never accepts more than two edits. Avoid filling a matrix
+  // when the length difference alone already makes a match impossible; this
+  // is especially important while a user holds a key or rapidly backspaces a
+  // long no-match query on the QML UI thread.
+  if (Math.abs(al - bl) > 2) return 99
 
   for (var j = 0; j <= bl; j++) levRow1[j] = j
 
@@ -627,6 +632,92 @@ var FILE_ICONS = {
   "\uf121": ["c", "h", "cpp", "hpp", "java", "kt", "swift", "cs", "php", "pl", "rb", "sql", "vim", "xml", "makefile"]
 }
 
+var IMAGE_PREVIEW_EXTENSIONS = {
+  png: true, jpg: true, jpeg: true, gif: true, webp: true, svg: true,
+  bmp: true, ico: true, tif: true, tiff: true, avif: true, pdf: true
+}
+
+var TEXT_PREVIEW_EXTENSIONS = {
+  txt: true, md: true, markdown: true, rst: true, log: true,
+  py: true, js: true, jsx: true, mjs: true, cjs: true, ts: true, tsx: true,
+  rs: true, go: true, lua: true, sh: true, bash: true, zsh: true, fish: true,
+  json: true, yaml: true, yml: true, toml: true, html: true, htm: true,
+  css: true, scss: true, c: true, h: true, cpp: true, hpp: true,
+  java: true, kt: true, swift: true, cs: true, php: true, pl: true,
+  rb: true, sql: true, vim: true, xml: true, makefile: true
+}
+
+var RESULT_PREVIEW_KINDS = {
+  app: "app",
+  file: "file",
+  project: "metadata",
+  "agent-session": "metadata"
+}
+
+function fileExtension(path) {
+  var name = String(path || "").split("/").pop().toLowerCase()
+  if (name === "makefile" || name === "dockerfile") return name
+  var dot = name.lastIndexOf(".")
+  return dot > 0 ? name.slice(dot + 1) : ""
+}
+
+var APP_CATEGORY_LABELS = {
+  AudioVideo: "Media", Audio: "Audio", Video: "Video",
+  Development: "Development", Education: "Education", Game: "Games",
+  Graphics: "Graphics", Network: "Internet", Office: "Office",
+  Science: "Science", Settings: "Settings", System: "System", Utility: "Utilities"
+}
+
+function appCategoryLabel(categories) {
+  var labels = []
+  var values = Array.isArray(categories) ? categories : []
+  for (var i = 0; i < values.length; i++) {
+    var label = APP_CATEGORY_LABELS[String(values[i] || "")]
+    if (label && labels.indexOf(label) < 0) labels.push(label)
+    if (labels.length === 2) break
+  }
+  return labels.join(" · ")
+}
+
+function appPreviewMetadata(row, nowMs) {
+  var metadata = []
+  var category = appCategoryLabel(row.categories)
+  if (category) metadata.push({ label: "Category", value: category })
+  if (row.lastUsed > 0) {
+    var age = relativeAge(row.lastUsed, nowMs)
+    metadata.push({ label: "Last opened", value: age === "now" ? "Just now" : age + " ago" })
+  }
+  if (row.useCount > 0)
+    metadata.push({ label: "Launches", value: row.useCount === 1 ? "Once" : String(row.useCount) + " times" })
+  if (row.appId) metadata.push({ label: "Application ID", value: String(row.appId) })
+  return metadata
+}
+
+function previewForRow(row, nowMs) {
+  if (!row || row.disabled) return { kind: "" }
+  var declaredKind = RESULT_PREVIEW_KINDS[row.kind] || ""
+  if (!declaredKind) return { kind: "" }
+  var previewKind = declaredKind
+  if (declaredKind === "file") {
+    var extension = fileExtension(row.target)
+    previewKind = IMAGE_PREVIEW_EXTENSIONS[extension] ? "image"
+      : TEXT_PREVIEW_EXTENSIONS[extension] ? "text"
+      : "metadata"
+  }
+  return {
+    kind: previewKind,
+    resultKind: row.kind,
+    title: row.label || row.target || "",
+    subtitle: row.kind === "app" ? (row.appSubtitle || "") : (row.detail || ""),
+    summary: row.summary || "",
+    metadata: row.kind === "app" ? appPreviewMetadata(row, nowMs) : [],
+    target: row.target || "",
+    icon: row.icon || "",
+    iconFont: row.iconFont || "",
+    appIcon: row.appIcon || ""
+  }
+}
+
 function iconForFile(path) {
   var name = String(path || "").split("/").pop().toLowerCase()
   if (name === "dockerfile" || name.indexOf("docker-compose") === 0) return "\ue7b0"
@@ -681,7 +772,10 @@ function fileSearchRows(frecencyMap, query, limit) {
       action: "",
       provider: "",
       score: 0,
-      section: ""
+      section: "",
+      lastUsed: record.lastUsed || 0,
+      useCount: record.count || 0,
+      pinned: record.pinned === true
     }
     if (typeof record.score === "number") {
       row.score = record.score + (baseHit ? 100000 : 0)
@@ -742,7 +836,10 @@ function scopedSearchRows(frecencyMap, scopeKind, query, limit, actionTemplate, 
       action: scopedAction(key, record.action, actionTemplate),
       provider: "",
       score: typeof record.score === "number" ? record.score : (record.lastUsed || 0),
-      section: ""
+      section: "",
+      lastUsed: record.lastUsed || 0,
+      useCount: record.count || 0,
+      pinned: record.pinned === true
     })
   }
 
@@ -774,7 +871,10 @@ function normalizeScopedResults(rows, scopeKind, actionTemplate, fallbackIcon) {
       action: scopedAction(target, item.action, actionTemplate),
       provider: item.provider || "",
       score: typeof item.score === "number" ? item.score : 0,
-      section: ""
+      section: "",
+      lastUsed: item.lastUsed || 0,
+      useCount: item.useCount || item.count || 0,
+      pinned: item.pinned === true
     }
   })
 }
@@ -791,16 +891,20 @@ var RESULT_ACTIONS = {
   openParent: { id: "open-parent", operation: "open-parent", icon: "", label: "Open Containing Folder", shortcut: "" },
   copyPath: { id: "copy-path", operation: "copy-target", icon: "", label: "Copy Path", shortcut: "" },
   copySessionId: { id: "copy-session-id", operation: "copy-target", icon: "", label: "Copy Session ID", shortcut: "" },
+  pin: { id: "pin", operation: "pin", icon: "󰐃", label: "Pin Result", shortcut: "", when: { field: "pinned", equals: false } },
+  unpin: { id: "unpin", operation: "unpin", icon: "󰤰", label: "Unpin Result", shortcut: "", when: { field: "pinned", equals: true } },
+  desktopActions: { operation: "desktop-action", source: "desktopActions" },
+  resetRanking: { id: "reset-ranking", operation: "reset-ranking", icon: "󰑐", label: "Reset Ranking", shortcut: "", when: { field: "activityKnown", equals: true } },
   forgetRecent: { id: "forget-recent", operation: "forget", icon: "󰆴", label: "Forget from Recents", shortcut: "", destructive: true },
   forgetConversation: { id: "forget-conversation", operation: "forget", icon: "󰆴", label: "Forget Conversation", shortcut: "", destructive: true },
   uninstallApp: { id: "uninstall-app", operation: "uninstall", icon: "󰆴", label: "Uninstall Application", shortcut: "", destructive: true }
 }
 
 var RESULT_ACTION_SETS = {
-  file: ["primary", "openParent", "copyPath", "forgetRecent"],
-  project: ["primary", "openParent", "copyPath", "forgetRecent"],
-  "agent-session": ["primary", "copySessionId", "forgetConversation"],
-  app: ["primary", "uninstallApp"]
+  file: ["primary", "openParent", "copyPath", "pin", "unpin", "forgetRecent"],
+  project: ["primary", "openParent", "copyPath", "pin", "unpin", "forgetRecent"],
+  "agent-session": ["primary", "copySessionId", "pin", "unpin", "forgetConversation"],
+  app: ["primary", "desktopActions", "pin", "unpin", "resetRanking", "uninstallApp"]
 }
 
 var PRIMARY_ACTION_LABELS = {
@@ -813,23 +917,108 @@ var PRIMARY_ACTION_LABELS = {
   link: "Open Menu"
 }
 
-function actionFromDefinition(name, kind) {
+function actionsFromDefinition(name, row) {
   var definition = RESULT_ACTIONS[name]
-  if (!definition) return null
-  return {
+  if (!definition) return []
+  if (definition.when && row[definition.when.field] !== definition.when.equals) return []
+  if (definition.source === "desktopActions") {
+    return (Array.isArray(row.desktopActions) ? row.desktopActions : []).map(function(action) {
+      return {
+        id: "desktop." + action.id,
+        operation: definition.operation,
+        target: action.id,
+        icon: "󰐊",
+        label: action.name,
+        shortcut: "",
+        destructive: false
+      }
+    })
+  }
+  return [{
     id: definition.id,
     operation: definition.operation,
     icon: definition.icon,
-    label: name === "primary" ? (PRIMARY_ACTION_LABELS[kind] || definition.label) : definition.label,
+    label: name === "primary" ? (PRIMARY_ACTION_LABELS[row.kind] || definition.label) : definition.label,
     shortcut: definition.shortcut,
     destructive: definition.destructive === true
-  }
+  }]
 }
 
 function actionsForRow(row) {
   if (!row || row.disabled || row.kind === "hint") return []
   var names = RESULT_ACTION_SETS[row.kind] || ["primary"]
-  return names.map(function(name) { return actionFromDefinition(name, row.kind) }).filter(function(action) { return action !== null })
+  var actions = []
+  for (var i = 0; i < names.length; i++) actions = actions.concat(actionsFromDefinition(names[i], row))
+  return actions
+}
+
+var RESULT_ACCESSORIES = {
+  pinned: { id: "pinned", icon: "󰐃", label: "Pinned" },
+  recency: { id: "recency", icon: "", label: "Last used" },
+  usage: { id: "usage", icon: "", label: "Uses" }
+}
+
+var RESULT_ACCESSORY_SETS = {
+  app: ["pinned", "recency"],
+  file: ["pinned", "recency"],
+  project: ["pinned", "recency"],
+  "agent-session": ["pinned", "recency"]
+}
+
+function activityKeyForRow(row) {
+  if (!row) return ""
+  return String(row.appId || row.target || row.itemId || "")
+}
+
+function relativeAge(timestamp, nowMs) {
+  var elapsed = Math.max(0, (nowMs || Date.now()) - Number(timestamp || 0))
+  var minute = 60000
+  var hour = 60 * minute
+  var day = 24 * hour
+  if (elapsed < minute) return "now"
+  if (elapsed < hour) return Math.floor(elapsed / minute) + "m"
+  if (elapsed < day) return Math.floor(elapsed / hour) + "h"
+  if (elapsed < 30 * day) return Math.floor(elapsed / day) + "d"
+  if (elapsed < 365 * day) return Math.floor(elapsed / (30 * day)) + "mo"
+  return Math.floor(elapsed / (365 * day)) + "y"
+}
+
+function accessoriesForRow(row, nowMs) {
+  var names = RESULT_ACCESSORY_SETS[row.kind] || []
+  var result = []
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i]
+    var definition = RESULT_ACCESSORIES[name]
+    if (name === "pinned" && row.pinned !== true) continue
+    if (name === "recency" && !(row.lastUsed > 0)) continue
+    if (name === "usage" && !(row.useCount > 1)) continue
+    result.push({
+      id: definition.id,
+      icon: definition.icon,
+      text: name === "recency" ? relativeAge(row.lastUsed, nowMs)
+        : name === "usage" ? String(row.useCount) : "",
+      label: definition.label
+    })
+  }
+  return result
+}
+
+function decorateResultRows(rows, frecencyMap, nowMs) {
+  return (rows || []).map(function(source) {
+    var row = Object.assign({}, source)
+    var record = (frecencyMap || {})[activityKeyForRow(row)] || {}
+    row.appSubtitle = row.appSubtitle || ""
+    row.summary = row.summary || ""
+    row.categories = Array.isArray(row.categories) ? row.categories : []
+    row.desktopActions = Array.isArray(row.desktopActions) ? row.desktopActions : []
+    if (!(row.lastUsed > 0)) row.lastUsed = record.lastUsed || 0
+    if (!(row.useCount > 0)) row.useCount = record.count || 0
+    if (row.pinned !== true) row.pinned = record.pinned === true
+    row.activityKnown = row.lastUsed > 0 || row.useCount > 0 || record.pinned === true
+    row.accessories = Array.isArray(row.accessories) && row.accessories.length > 0
+      ? row.accessories : accessoriesForRow(row, nowMs)
+    return row
+  })
 }
 
 // Pure state transition for the activity search protocol. Keeping validation
@@ -887,9 +1076,14 @@ function displayRow(items, itemOrder, checkedResults, disabledResults, entry, de
     iconFont: entry.iconFont || "",
     appIcon: entry.appIcon || "",
     appId: entry.appId || "",
+    appSubtitle: entry.kind === "app" ? (entry.appSubtitle || entry.description || "") : "",
+    summary: entry.summary || "",
+    categories: Array.isArray(entry.categories) ? entry.categories : [],
+    desktopActions: Array.isArray(entry.desktopActions) ? entry.desktopActions : [],
     label: labelFor(entry, checkedResults, disabledResults),
     target: target,
-    detail: detail || "",
+    detail: entry.kind === "app" && (entry.appSubtitle || entry.description)
+      ? (entry.appSubtitle || entry.description) : (detail || ""),
     path: pathFor(items, entry.id),
     childCount: (entry.kind === "menu" || entry.kind === "link") ? childCount(items, itemOrder, target) : 0,
     action: entry.action || "",
@@ -1022,10 +1216,17 @@ if (typeof module !== "undefined") {
     matchesQuery: matchesQuery,
     searchScore: searchScore,
     fileSearchRows: fileSearchRows,
+    fileExtension: fileExtension,
+    previewForRow: previewForRow,
+    appCategoryLabel: appCategoryLabel,
     scopedSearchRows: scopedSearchRows,
     normalizeScopedResults: normalizeScopedResults,
     parentDirectory: parentDirectory,
     actionsForRow: actionsForRow,
+    activityKeyForRow: activityKeyForRow,
+    relativeAge: relativeAge,
+    accessoriesForRow: accessoriesForRow,
+    decorateResultRows: decorateResultRows,
     reduceScopeSearchEvent: reduceScopeSearchEvent,
     sessionSearchRows: sessionSearchRows,
     iconForFile: iconForFile,

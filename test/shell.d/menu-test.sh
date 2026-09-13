@@ -7,8 +7,10 @@ source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/base-test.sh"
 run_node_test <<'JS'
 const fs = require('fs')
 const menu = requireFromRoot('shell/plugins/menu/MenuModel.js')
+const menuModelJs = fs.readFileSync(path.join(root, 'shell/plugins/menu/MenuModel.js'), 'utf8')
 const menuQml = fs.readFileSync(path.join(root, 'shell/plugins/menu/Menu.qml'), 'utf8')
 const actionPanelQml = fs.readFileSync(path.join(root, 'shell/plugins/menu/ActionPanel.qml'), 'utf8')
+const previewPaneQml = fs.readFileSync(path.join(root, 'shell/plugins/menu/PreviewPane.qml'), 'utf8')
 const scopeSearchQml = fs.readFileSync(path.join(root, 'shell/plugins/menu/ScopeSearchController.qml'), 'utf8')
 const defaultMenuJsonc = fs.readFileSync(path.join(root, 'default/omarchy/omarchy-menu.jsonc'), 'utf8')
 const shellQml = fs.readFileSync(path.join(root, 'shell/shell.qml'), 'utf8')
@@ -118,6 +120,10 @@ assertDeepEqual(
     iconFont: '',
     appIcon: '',
     appId: '',
+    appSubtitle: '',
+    summary: '',
+    categories: [],
+    desktopActions: [],
     label: 'Theme picker',
     target: 'style.theme',
     detail: 'Style',
@@ -157,6 +163,71 @@ assert(menuQml.includes('event.key === Qt.Key_K && (event.modifiers & Qt.Control
 assert(menuQml.includes('mouse.button === Qt.RightButton'), 'menu opens actions from a row context click')
 assertEqual(menu.actionsForRow({ kind: 'file' })[2].operation, 'copy-target', 'result actions separate stable operations from type-specific presentation')
 assert(actionPanelQml.includes('signal triggered(var action)'), 'action panel returns declarative action descriptors to the menu')
+assert(actionPanelQml.includes('ListView {') && actionPanelQml.includes('ListView.Contain'), 'action panel caps long app action lists and keeps keyboard selection visible')
+
+const nativeAppActions = menu.actionsForRow({
+  kind: 'app', appId: 'firefox', label: 'Firefox', disabled: false,
+  desktopActions: [
+    { id: 'new-window', name: 'New Window', icon: 'window-new' },
+    { id: 'private-window', name: 'New Private Window', icon: '' }
+  ]
+})
+assertDeepEqual(nativeAppActions.map(action => action.id), ['primary', 'desktop.new-window', 'desktop.private-window', 'uninstall-app'], 'application action panel expands every declared desktop action in order')
+assertEqual(nativeAppActions[2].operation, 'desktop-action', 'native application actions use a stable declarative operation')
+assertEqual(nativeAppActions[2].target, 'private-window', 'native application action descriptors retain only their action id')
+
+assertEqual(menu.previewForRow({ kind: 'file', target: '/tmp/manual.pdf', label: 'Manual' }).kind, 'image', 'menu previews PDF and image files visually')
+assertEqual(menu.previewForRow({ kind: 'file', target: '/tmp/readme.md', label: 'Readme' }).kind, 'text', 'menu previews known text files as text')
+assertEqual(menu.previewForRow({ kind: 'file', target: '/tmp/archive.zip', label: 'Archive' }).kind, 'metadata', 'menu falls back to metadata for opaque files')
+const appPreview = menu.previewForRow({
+  kind: 'app', label: 'Firefox', appIcon: 'firefox', appId: 'firefox',
+  appSubtitle: 'Web Browser', summary: 'Browse the Web', categories: ['Network', 'WebBrowser'],
+  lastUsed: 1000, useCount: 3
+}, 121000)
+assertEqual(appPreview.kind, 'app', 'menu previews applications through their icon')
+assertEqual(appPreview.subtitle, 'Web Browser', 'application previews retain the desktop entry generic name')
+assertEqual(appPreview.summary, 'Browse the Web', 'application previews retain the desktop entry comment')
+assertDeepEqual(appPreview.metadata, [
+  { label: 'Category', value: 'Internet' },
+  { label: 'Last opened', value: '2m ago' },
+  { label: 'Launches', value: '3 times' },
+  { label: 'Application ID', value: 'firefox' }
+], 'application previews expose useful structured metadata')
+assertEqual(menu.previewForRow({ kind: 'menu', label: 'Setup' }).kind, '', 'menu does not expand for non-previewable command rows')
+assert(menuQml.includes('MenuModel.previewForRow(displayModel.get(index), Date.now())'), 'menu derives previews from the selected result descriptor')
+assert(menuQml.includes('PreviewPane {'), 'menu delegates preview rendering to the preview pane')
+assert(menuQml.includes('width: root.previewSpaceReserved'), 'result views reserve a stable detail column as selection changes')
+assert(
+  /function hasPreviewableRows\(serial\) \{[\s\S]*?MenuModel\.previewForRow\(displayModel\.get\(i\)\)\.kind !== ""/.test(menuQml)
+    && menuQml.includes('root.hasPreviewableRows(layoutSerial)'),
+  'fallback and loading states use the full card unless the displayed result set can show a preview'
+)
+assert(
+  menuQml.includes('label: "Ask Agent"')
+    && menuQml.includes('label: "Search the Web"'),
+  'fallback commands use concise full-width actions without a redundant heading'
+)
+assert(!menuQml.includes('Use “" + root.filterText'), 'fallback commands do not add a decorative query heading')
+assert(
+  /property int cardWidth: Math\.min\(root\.dmenuActive \? Style\.space\(root\.dmenuWidth\)\s*\n\s*: root\.standardCardWidth/.test(menuQml),
+  'every normal launcher route uses one fixed outer width while dmenu keeps its requested width'
+)
+assert(menuQml.includes('anchors.horizontalCenter: parent.horizontalCenter'), 'the fixed-width launcher card remains horizontally centered')
+assert(menuQml.includes('interval: 32'), 'menu coalesces sustained key-repeat bursts while text updates immediately')
+assert(
+  !/visibleRowsHeight:[^\n]*filterText/.test(menuQml),
+  'filter text changes do not synchronously walk row layout before results change'
+)
+assert(
+  /var previousWasEmpty = !root\.filterText\.trim\(\)[\s\S]*?if \(previousWasEmpty\) root\.loadProvidersForSearch\(\)/.test(menuQml),
+  'menu scans unloaded providers once when search begins rather than on every key'
+)
+assert(
+  menuModelJs.includes('if (Math.abs(al - bl) > 2) return 99'),
+  'typo matching rejects impossible length differences before allocating UI-thread work'
+)
+assert(previewPaneQml.includes('["head", "-c", "12288", "--", root.descriptor.target]'), 'text previews read a bounded amount without a shell')
+assert(previewPaneQml.includes('model: root.descriptor.metadata || []'), 'preview pane renders structured application metadata declaratively')
 
 const defaultItems = menu.parseMenuJsonc(defaultMenuJsonc)
 const defaultById = Object.fromEntries(defaultItems.map(item => [item.id, item]))
@@ -796,11 +867,30 @@ assertEqual(matchScoped[0].label, 'Fix schema bug', 'scopedSearchRows uses item 
 assertEqual(matchScoped[0].action, "omarchy agent resume '01a079e9-sess'", 'scopedSearchRows configures templated action')
 
 const normalizedScoped = menu.normalizeScopedResults([
-  { target: "session'one", label: 'Session one', score: 7 }
+  { target: "session'one", label: 'Session one', score: 7, lastUsed: 1000, useCount: 3, pinned: true }
 ], 'agent-session', 'omarchy agent resume {}', '')
 assertEqual(normalizedScoped[0].kind, 'agent-session', 'streamed scope results inherit their declared kind')
 assertEqual(normalizedScoped[0].icon, '', 'streamed scope results inherit their fallback icon')
 assertEqual(normalizedScoped[0].action, "omarchy agent resume 'session'\\''one'", 'streamed scope results safely receive the menu action template')
+assert(normalizedScoped[0].pinned && normalizedScoped[0].useCount === 3, 'streamed scope results retain rich activity metadata')
+
+assertEqual(menu.relativeAge(1000, 31000), 'now', 'result recency rounds sub-minute ages to now')
+assertEqual(menu.relativeAge(1000, 3 * 60 * 60000 + 1000), '3h', 'result recency formats compact hours')
+const richRows = menu.decorateResultRows([
+  { kind: 'file', target: '/tmp/report.pdf' },
+  { kind: 'app', appId: 'org.example.App' }
+], {
+  '/tmp/report.pdf': { lastUsed: 1000, count: 4, pinned: true },
+  'org.example.App': { lastUsed: 61000, count: 2 }
+}, 121000)
+assertDeepEqual(richRows[0].accessories.map(a => a.id), ['pinned', 'recency'], 'file results declare multiple ordered accessories')
+assertEqual(richRows[0].accessories[1].text, '2m', 'result rows expose compact recency')
+assertDeepEqual(menu.actionsForRow(richRows[0]).map(a => a.id), ['primary', 'open-parent', 'copy-path', 'unpin', 'forget-recent'], 'pinned files declaratively replace Pin with Unpin')
+assertDeepEqual(menu.actionsForRow(richRows[1]).map(a => a.id), ['primary', 'pin', 'reset-ranking', 'uninstall-app'], 'used apps declaratively offer Pin and Reset Ranking')
+const declaredAccessory = menu.decorateResultRows([
+  { kind: 'fallback', accessories: [{ id: 'context', text: 'Default agent' }] }
+], {}, 121000)
+assertDeepEqual(declaredAccessory[0].accessories, [{ id: 'context', text: 'Default agent' }], 'result decoration preserves explicitly declared contextual accessories')
 
 const firstBatch = menu.reduceScopeSearchEvent([], false, {
   version: 1, source: 'activity', queryId: '7', type: 'rows', rows: [{ target: 'one' }]
