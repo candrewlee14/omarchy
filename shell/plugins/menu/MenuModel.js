@@ -733,7 +733,10 @@ function fileSearchRows(frecencyMap, query, limit) {
       action: "",
       provider: "",
       score: 0,
-      section: ""
+      section: "",
+      lastUsed: record.lastUsed || 0,
+      useCount: record.count || 0,
+      pinned: record.pinned === true
     }
     if (typeof record.score === "number") {
       row.score = record.score + (baseHit ? 100000 : 0)
@@ -794,7 +797,10 @@ function scopedSearchRows(frecencyMap, scopeKind, query, limit, actionTemplate, 
       action: scopedAction(key, record.action, actionTemplate),
       provider: "",
       score: typeof record.score === "number" ? record.score : (record.lastUsed || 0),
-      section: ""
+      section: "",
+      lastUsed: record.lastUsed || 0,
+      useCount: record.count || 0,
+      pinned: record.pinned === true
     })
   }
 
@@ -826,7 +832,10 @@ function normalizeScopedResults(rows, scopeKind, actionTemplate, fallbackIcon) {
       action: scopedAction(target, item.action, actionTemplate),
       provider: item.provider || "",
       score: typeof item.score === "number" ? item.score : 0,
-      section: ""
+      section: "",
+      lastUsed: item.lastUsed || 0,
+      useCount: item.useCount || item.count || 0,
+      pinned: item.pinned === true
     }
   })
 }
@@ -843,16 +852,18 @@ var RESULT_ACTIONS = {
   openParent: { id: "open-parent", operation: "open-parent", icon: "", label: "Open Containing Folder", shortcut: "" },
   copyPath: { id: "copy-path", operation: "copy-target", icon: "", label: "Copy Path", shortcut: "" },
   copySessionId: { id: "copy-session-id", operation: "copy-target", icon: "", label: "Copy Session ID", shortcut: "" },
+  pin: { id: "pin", operation: "pin", icon: "󰐃", label: "Pin Result", shortcut: "", when: { field: "pinned", equals: false } },
+  unpin: { id: "unpin", operation: "unpin", icon: "󰤰", label: "Unpin Result", shortcut: "", when: { field: "pinned", equals: true } },
   forgetRecent: { id: "forget-recent", operation: "forget", icon: "󰆴", label: "Forget from Recents", shortcut: "", destructive: true },
   forgetConversation: { id: "forget-conversation", operation: "forget", icon: "󰆴", label: "Forget Conversation", shortcut: "", destructive: true },
   uninstallApp: { id: "uninstall-app", operation: "uninstall", icon: "󰆴", label: "Uninstall Application", shortcut: "", destructive: true }
 }
 
 var RESULT_ACTION_SETS = {
-  file: ["primary", "openParent", "copyPath", "forgetRecent"],
-  project: ["primary", "openParent", "copyPath", "forgetRecent"],
-  "agent-session": ["primary", "copySessionId", "forgetConversation"],
-  app: ["primary", "uninstallApp"]
+  file: ["primary", "openParent", "copyPath", "pin", "unpin", "forgetRecent"],
+  project: ["primary", "openParent", "copyPath", "pin", "unpin", "forgetRecent"],
+  "agent-session": ["primary", "copySessionId", "pin", "unpin", "forgetConversation"],
+  app: ["primary", "pin", "unpin", "uninstallApp"]
 }
 
 var PRIMARY_ACTION_LABELS = {
@@ -865,14 +876,15 @@ var PRIMARY_ACTION_LABELS = {
   link: "Open Menu"
 }
 
-function actionFromDefinition(name, kind) {
+function actionFromDefinition(name, row) {
   var definition = RESULT_ACTIONS[name]
   if (!definition) return null
+  if (definition.when && row[definition.when.field] !== definition.when.equals) return null
   return {
     id: definition.id,
     operation: definition.operation,
     icon: definition.icon,
-    label: name === "primary" ? (PRIMARY_ACTION_LABELS[kind] || definition.label) : definition.label,
+    label: name === "primary" ? (PRIMARY_ACTION_LABELS[row.kind] || definition.label) : definition.label,
     shortcut: definition.shortcut,
     destructive: definition.destructive === true
   }
@@ -881,7 +893,70 @@ function actionFromDefinition(name, kind) {
 function actionsForRow(row) {
   if (!row || row.disabled || row.kind === "hint") return []
   var names = RESULT_ACTION_SETS[row.kind] || ["primary"]
-  return names.map(function(name) { return actionFromDefinition(name, row.kind) }).filter(function(action) { return action !== null })
+  return names.map(function(name) { return actionFromDefinition(name, row) }).filter(function(action) { return action !== null })
+}
+
+var RESULT_ACCESSORIES = {
+  pinned: { id: "pinned", icon: "󰐃", label: "Pinned" },
+  recency: { id: "recency", icon: "", label: "Last used" },
+  usage: { id: "usage", icon: "", label: "Uses" }
+}
+
+var RESULT_ACCESSORY_SETS = {
+  app: ["pinned", "recency"],
+  file: ["pinned", "recency"],
+  project: ["pinned", "recency"],
+  "agent-session": ["pinned", "recency"]
+}
+
+function activityKeyForRow(row) {
+  if (!row) return ""
+  return String(row.appId || row.target || row.itemId || "")
+}
+
+function relativeAge(timestamp, nowMs) {
+  var elapsed = Math.max(0, (nowMs || Date.now()) - Number(timestamp || 0))
+  var minute = 60000
+  var hour = 60 * minute
+  var day = 24 * hour
+  if (elapsed < minute) return "now"
+  if (elapsed < hour) return Math.floor(elapsed / minute) + "m"
+  if (elapsed < day) return Math.floor(elapsed / hour) + "h"
+  if (elapsed < 30 * day) return Math.floor(elapsed / day) + "d"
+  if (elapsed < 365 * day) return Math.floor(elapsed / (30 * day)) + "mo"
+  return Math.floor(elapsed / (365 * day)) + "y"
+}
+
+function accessoriesForRow(row, nowMs) {
+  var names = RESULT_ACCESSORY_SETS[row.kind] || []
+  var result = []
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i]
+    var definition = RESULT_ACCESSORIES[name]
+    if (name === "pinned" && row.pinned !== true) continue
+    if (name === "recency" && !(row.lastUsed > 0)) continue
+    if (name === "usage" && !(row.useCount > 1)) continue
+    result.push({
+      id: definition.id,
+      icon: definition.icon,
+      text: name === "recency" ? relativeAge(row.lastUsed, nowMs)
+        : name === "usage" ? String(row.useCount) : "",
+      label: definition.label
+    })
+  }
+  return result
+}
+
+function decorateResultRows(rows, frecencyMap, nowMs) {
+  return (rows || []).map(function(source) {
+    var row = Object.assign({}, source)
+    var record = (frecencyMap || {})[activityKeyForRow(row)] || {}
+    if (!(row.lastUsed > 0)) row.lastUsed = record.lastUsed || 0
+    if (!(row.useCount > 0)) row.useCount = record.count || 0
+    if (row.pinned !== true) row.pinned = record.pinned === true
+    row.accessories = accessoriesForRow(row, nowMs)
+    return row
+  })
 }
 
 // Pure state transition for the activity search protocol. Keeping validation
@@ -1080,6 +1155,10 @@ if (typeof module !== "undefined") {
     normalizeScopedResults: normalizeScopedResults,
     parentDirectory: parentDirectory,
     actionsForRow: actionsForRow,
+    activityKeyForRow: activityKeyForRow,
+    relativeAge: relativeAge,
+    accessoriesForRow: accessoriesForRow,
+    decorateResultRows: decorateResultRows,
     reduceScopeSearchEvent: reduceScopeSearchEvent,
     sessionSearchRows: sessionSearchRows,
     iconForFile: iconForFile,

@@ -593,6 +593,10 @@ Item {
     return MenuModel.displayRow(root.items, root.itemOrder, root.checkedResults, root.disabledResults, entry, detail, score, section)
   }
 
+  function decorateResultRows(rows) {
+    return MenuModel.decorateResultRows(rows, root.frecencyMap, Date.now())
+  }
+
   function rowSelectable(index) {
     if (index < 0 || index >= displayModel.count) return false
     return !displayModel.get(index).disabled
@@ -660,7 +664,8 @@ Item {
         action: "",
         provider: "",
         score: i,
-        section: ""
+        section: "",
+        accessories: []
       })
     }
 
@@ -748,6 +753,7 @@ Item {
         })
       }
 
+      rows = root.decorateResultRows(rows)
       var appendCount = Math.min(rows.length, 30)
       var oldCount = displayModel.count
       var common = Math.min(oldCount, appendCount)
@@ -956,6 +962,7 @@ Item {
       }
     }
 
+    rows = root.decorateResultRows(rows)
     var appendCount = Math.min(rows.length, 30)
     // Update in place so the ListView reuses its delegates: clear()+append
     // destroys and recreates up to 30 rows per keystroke, while successive
@@ -1172,6 +1179,16 @@ Item {
     } else if (action.operation === "forget") {
       root.cancel()
       Util.execDetached("omarchy-activity forget " + Util.shellQuote(row.target) + " --kind " + Util.shellQuote(row.kind))
+    } else if (action.operation === "pin" || action.operation === "unpin") {
+      var activityKey = MenuModel.activityKeyForRow(row)
+      var map = Object.assign({}, root.frecencyMap || ({}))
+      var record = Object.assign({}, map[activityKey] || ({}))
+      record.pinned = action.operation === "pin"
+      map[activityKey] = record
+      root.frecencyMap = map
+      root.rebuildDisplay()
+      Util.execDetached("omarchy-activity " + action.operation + " " + Util.shellQuote(activityKey)
+        + " --kind " + Util.shellQuote(row.kind))
     } else if (action.operation === "uninstall" && row.kind === "app") {
       root.deleteTarget = { appId: row.appId, label: row.label }
       deleteConfirm.selectedIndex = 1
@@ -1886,6 +1903,7 @@ Item {
               required property string path
               required property string action
               required property int childCount
+              required property var accessories
 
               readonly property bool hasCursor: root.cursorActive && row.index === root.selectedIndex
               readonly property bool isApp: row.kind === "app"
@@ -1980,11 +1998,26 @@ Item {
 
               Row {
                 id: trail
-                width: Style.space(14)
+                width: implicitWidth
                 anchors.right: parent.right
                 anchors.rightMargin: root.rowReservedBorderRight + Style.space(8)
                 y: contentColumn.y + labelText.y + (labelText.height - height) / 2
-                spacing: 0
+                spacing: Style.space(7)
+
+                Repeater {
+                  model: row.accessories
+
+                  Text {
+                    required property var modelData
+                    textFormat: Text.PlainText
+                    text: (modelData.icon || "") + (modelData.icon && modelData.text ? " " : "") + (modelData.text || "")
+                    color: row.hasCursor ? root.selectedText : root.foreground
+                    opacity: 0.42
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
 
                 Text {
                   textFormat: Text.PlainText

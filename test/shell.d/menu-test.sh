@@ -806,11 +806,26 @@ assertEqual(matchScoped[0].label, 'Fix schema bug', 'scopedSearchRows uses item 
 assertEqual(matchScoped[0].action, "omarchy agent resume '01a079e9-sess'", 'scopedSearchRows configures templated action')
 
 const normalizedScoped = menu.normalizeScopedResults([
-  { target: "session'one", label: 'Session one', score: 7 }
+  { target: "session'one", label: 'Session one', score: 7, lastUsed: 1000, useCount: 3, pinned: true }
 ], 'agent-session', 'omarchy agent resume {}', '')
 assertEqual(normalizedScoped[0].kind, 'agent-session', 'streamed scope results inherit their declared kind')
 assertEqual(normalizedScoped[0].icon, '', 'streamed scope results inherit their fallback icon')
 assertEqual(normalizedScoped[0].action, "omarchy agent resume 'session'\\''one'", 'streamed scope results safely receive the menu action template')
+assert(normalizedScoped[0].pinned && normalizedScoped[0].useCount === 3, 'streamed scope results retain rich activity metadata')
+
+assertEqual(menu.relativeAge(1000, 31000), 'now', 'result recency rounds sub-minute ages to now')
+assertEqual(menu.relativeAge(1000, 3 * 60 * 60000 + 1000), '3h', 'result recency formats compact hours')
+const richRows = menu.decorateResultRows([
+  { kind: 'file', target: '/tmp/report.pdf' },
+  { kind: 'app', appId: 'org.example.App' }
+], {
+  '/tmp/report.pdf': { lastUsed: 1000, count: 4, pinned: true },
+  'org.example.App': { lastUsed: 61000, count: 2 }
+}, 121000)
+assertDeepEqual(richRows[0].accessories.map(a => a.id), ['pinned', 'recency'], 'file results declare multiple ordered accessories')
+assertEqual(richRows[0].accessories[1].text, '2m', 'result rows expose compact recency')
+assertDeepEqual(menu.actionsForRow(richRows[0]).map(a => a.id), ['primary', 'open-parent', 'copy-path', 'unpin', 'forget-recent'], 'pinned files declaratively replace Pin with Unpin')
+assertDeepEqual(menu.actionsForRow(richRows[1]).map(a => a.id), ['primary', 'pin', 'uninstall-app'], 'unpinned apps declaratively offer Pin')
 
 const firstBatch = menu.reduceScopeSearchEvent([], false, {
   version: 1, source: 'activity', queryId: '7', type: 'rows', rows: [{ target: 'one' }]

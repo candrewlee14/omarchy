@@ -162,9 +162,11 @@ for scripts and terminals.
 
 ## Result actions
 
-Press `Ctrl+K` on a selected result, or right-click it, to open its action panel. The first row is the result's normal Enter behavior. Files and projects also expose their containing folder, path copying, and removal from activity history; agent conversations expose session-id copying and history removal; applications expose uninstall. `MenuModel.js` declares reusable action definitions and the ordered action set for each result kind. `ActionPanel.qml` only presents those descriptors, while `Menu.qml` executes their small, stable operation vocabulary. This keeps row-specific capabilities out of keyboard and pointer handlers and lets each kind grow multiple actions without another input-handler branch.
+Press `Ctrl+K` on a selected result, or right-click it, to open its action panel. The first row is the result's normal Enter behavior. Files and projects also expose their containing folder, path copying, pinning, and removal from activity history; agent conversations expose session-id copying, pinning, and history removal; applications expose pinning and uninstall. `MenuModel.js` declares reusable action definitions and the ordered action set for each result kind. `ActionPanel.qml` only presents those descriptors, while `Menu.qml` executes their small, stable operation vocabulary. This keeps row-specific capabilities out of keyboard and pointer handlers and lets each kind grow multiple actions without another input-handler branch.
 
 Previewable results expand the card with a descriptor-driven pane. Applications show their desktop icon; supported images and PDFs render directly through Qt; known text formats load asynchronously with a hard 12 KiB read cap; opaque files, projects, and conversations show structured metadata. `MenuModel.js` maps result kinds and file extensions to preview descriptors, while `PreviewPane.qml` owns bounded loading and presentation. Moving the cursor across ordinary command rows never starts preview work or widens the card.
+
+Recent result rows also expose compact accessories such as pinned state and relative last-used time. Accessory definitions and the ordered set for each result kind live alongside the action definitions in `MenuModel.js`; the delegate only repeats the descriptors it receives. These values come from the activity snapshot loaded when the menu opens or from streamed search rows, so rendering them starts no watcher or background process.
 
 ## Select and input modes
 

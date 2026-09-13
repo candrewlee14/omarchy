@@ -279,7 +279,7 @@ pass "activity import-agents seeds sessions"
 
 # search queries SQLite FTS5 index
 search_out=$("$activity" search "Refactor queries" --kind agent-session)
-jq -e 'length == 1 and .[0].target == "ag-sess-1" and .[0].label == "Refactor database queries"' <<<"$search_out" >/dev/null ||
+jq -e 'length == 1 and .[0].target == "ag-sess-1" and .[0].label == "Refactor database queries" and .[0].lastUsed > 0 and .[0].useCount > 0 and .[0].pinned == false' <<<"$search_out" >/dev/null ||
   fail "activity search matches session title via FTS5" "$search_out"
 pass "activity search matches session title via FTS5"
 
@@ -305,7 +305,7 @@ pass "activity search weights titles above targets"
 # Pins retain their promise to float above scored results, including FTS.
 "$activity" pin needle-target --kind agent-session >/dev/null
 pinned_search=$("$activity" search needle --kind agent-session)
-[[ $(jq -r '.[0].target' <<<"$pinned_search") == "needle-target" ]] ||
+jq -e '.[0].target == "needle-target" and .[0].pinned == true' <<<"$pinned_search" >/dev/null ||
   fail "activity search keeps pinned matches first" "$pinned_search"
 pass "activity search keeps pinned matches first"
 
