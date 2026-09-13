@@ -55,7 +55,13 @@ Item {
     } else {
       return false
     }
+    Qt.callLater(root.revealSelection)
     return true
+  }
+
+  function revealSelection() {
+    if (selectedIndex >= 0 && selectedIndex < actions.length)
+      actionList.positionViewAtIndex(selectedIndex, ListView.Contain)
   }
 
   visible: opened
@@ -69,8 +75,9 @@ Item {
   BorderSurface {
     id: card
     width: Math.min(parent.width - Style.space(28), Style.space(360))
-    height: card.contentTopInset + card.contentBottomInset + Style.space(26)
-      + root.actions.length * (Style.space(42) + Style.space(8))
+    readonly property int desiredHeight: card.contentTopInset + card.contentBottomInset
+      + Style.space(26) + root.actions.length * (Style.space(42) + Style.space(8))
+    height: Math.min(parent.height - Style.space(28), desiredHeight)
     anchors.centerIn: parent
     color: root.background
     borderSpec: Border.flat(root.selectedText, Style.normalBorderWidth)
@@ -100,15 +107,21 @@ Item {
         verticalAlignment: Text.AlignVCenter
       }
 
-      Repeater {
+      ListView {
+        id: actionList
+        width: parent.width
+        height: parent.height - Style.space(34)
         model: root.actions
+        spacing: Style.space(8)
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
 
-        BorderSurface {
+        delegate: BorderSurface {
           required property int index
           required property var modelData
           readonly property bool selected: root.selectedIndex === index
 
-          width: parent.width
+          width: ListView.view.width
           height: Style.space(42)
           radius: root.cornerRadius
           color: selected ? root.selectedBackground : "transparent"

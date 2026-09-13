@@ -265,7 +265,7 @@ def cmd_top(args) -> int:
     now_ms = int(time.time() * 1000)
     blended = args.via == "blended"
     query = (
-        "SELECT i.target, i.kind, i.title, i.icon, i.icon_font, i.detail, i.action, COUNT(v.at) AS uses, MAX(v.at) AS last_used, "
+        "SELECT i.target, i.kind, i.title, i.icon, i.icon_font, i.detail, i.action, i.bonus, COUNT(v.at) AS uses, MAX(v.at) AS last_used, "
         f"{score_case(now_ms, blended)} AS score "
         "FROM items i JOIN visits v ON v.kind = i.kind AND v.target = i.target "
     )
@@ -289,6 +289,7 @@ def cmd_top(args) -> int:
         item_obj = {
             "count": r["uses"],
             "lastUsed": r["last_used"],
+            "pinned": r["bonus"] > 0,
             "score": r["score"],
             "kind": r["kind"],
             "title": r["title"] or "",
@@ -361,7 +362,8 @@ def search_rows(query: str, kind: str, limit: int, conn: sqlite3.Connection | No
            i.bonus,
            {query_score} AS query_score,
            {frecency} AS frecency,
-           (SELECT at FROM visits WHERE kind = i.kind AND target = i.target ORDER BY at DESC LIMIT 1) AS last_used
+           (SELECT at FROM visits WHERE kind = i.kind AND target = i.target ORDER BY at DESC LIMIT 1) AS last_used,
+           (SELECT COUNT(at) FROM visits WHERE kind = i.kind AND target = i.target) AS uses
     FROM items_fts f
     JOIN items i ON i.rowid = f.rowid
     WHERE {' AND '.join(where)}
@@ -457,6 +459,9 @@ def search_rows(query: str, kind: str, limit: int, conn: sqlite3.Connection | No
             "provider": "",
             "score": float(r["score"]) if r["score"] is not None else 0.0,
             "section": "",
+            "lastUsed": int(r["last_used"] or 0),
+            "useCount": int(r["uses"] or 0),
+            "pinned": int(r["bonus"] or 0) > 0,
         }
         results.append(result)
     return results
