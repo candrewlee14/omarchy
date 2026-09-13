@@ -694,6 +694,14 @@ function fileSearchRows(frecencyMap, query, limit) {
   return scored.concat(unscored).slice(0, Math.max(0, limit || 5))
 }
 
+function scopedAction(target, action, actionTemplate) {
+  if (action || !actionTemplate) return action || ""
+  var quotedTarget = "'" + String(target || "").replace(/'/g, "'\\''") + "'"
+  return actionTemplate.indexOf("{}") >= 0
+    ? actionTemplate.replace("{}", quotedTarget)
+    : actionTemplate + " " + quotedTarget
+}
+
 function scopedSearchRows(frecencyMap, scopeKind, query, limit, actionTemplate, fallbackIcon) {
   if (!frecencyMap || !scopeKind) return []
   var terms = String(query || "").toLowerCase().trim().split(/\s+/).filter(function(t) { return t })
@@ -718,13 +726,6 @@ function scopedSearchRows(frecencyMap, scopeKind, query, limit, actionTemplate, 
     if (!match) continue
 
     var label = record.title || (scopeKind + " " + (key.length > 12 ? key.slice(0, 8) : key))
-    var action = record.action || ""
-    if (!action && actionTemplate) {
-      action = actionTemplate.indexOf("{}") >= 0
-        ? actionTemplate.replace("{}", "'" + key.replace(/'/g, "'\\''") + "'")
-        : actionTemplate + " '" + key.replace(/'/g, "'\\''") + "'"
-    }
-
     scored.push({
       itemId: scopeKind + "." + key,
       disabled: false,
@@ -738,7 +739,7 @@ function scopedSearchRows(frecencyMap, scopeKind, query, limit, actionTemplate, 
       detail: record.detail || (key.length > 12 ? key.slice(0, 8) : key),
       path: "",
       childCount: 0,
-      action: action,
+      action: scopedAction(key, record.action, actionTemplate),
       provider: "",
       score: typeof record.score === "number" ? record.score : (record.lastUsed || 0),
       section: ""
@@ -750,6 +751,73 @@ function scopedSearchRows(frecencyMap, scopeKind, query, limit, actionTemplate, 
     return a.label.localeCompare(b.label)
   })
   return scored.slice(0, max)
+}
+
+function normalizeScopedResults(rows, scopeKind, actionTemplate, fallbackIcon) {
+  if (!Array.isArray(rows)) return []
+  return rows.map(function(item) {
+    item = item || {}
+    var target = String(item.target || "")
+    return {
+      itemId: item.itemId || (scopeKind + "." + target),
+      disabled: false,
+      kind: item.kind || scopeKind,
+      icon: item.icon || fallbackIcon || "",
+      iconFont: item.iconFont || "",
+      appIcon: item.appIcon || "",
+      appId: item.appId || "",
+      label: item.label || target,
+      target: target,
+      detail: item.detail || target,
+      path: item.path || "",
+      childCount: 0,
+      action: scopedAction(target, item.action, actionTemplate),
+      provider: item.provider || "",
+      score: typeof item.score === "number" ? item.score : 0,
+      section: ""
+    }
+  })
+}
+
+// Pure state transition for the activity search protocol. Keeping validation
+// here makes stale/error/partial-result behavior testable outside QML.
+function reduceScopeSearchEvent(rows, started, event, queryId) {
+  var currentRows = Array.isArray(rows) ? rows : []
+  var rejected = { accepted: false, rows: currentRows, started: !!started, terminal: false, failed: false, changed: false }
+  if (!event || event.version !== 1 || event.source !== "activity"
+      || String(event.queryId) !== String(queryId)) return rejected
+
+  if (event.type === "rows" && Array.isArray(event.rows)) {
+    return {
+      accepted: true,
+      rows: currentRows.concat(event.rows),
+      started: true,
+      terminal: false,
+      failed: false,
+      changed: event.rows.length > 0
+    }
+  }
+  if (event.type === "done") {
+    return {
+      accepted: true,
+      rows: currentRows,
+      started: !!started,
+      terminal: true,
+      failed: false,
+      changed: !started
+    }
+  }
+  if (event.type === "error") {
+    return {
+      accepted: true,
+      rows: currentRows,
+      started: !!started,
+      terminal: true,
+      failed: true,
+      changed: false
+    }
+  }
+  return rejected
 }
 
 function sessionSearchRows(frecencyMap, query, limit) {
@@ -902,6 +970,8 @@ if (typeof module !== "undefined") {
     searchScore: searchScore,
     fileSearchRows: fileSearchRows,
     scopedSearchRows: scopedSearchRows,
+    normalizeScopedResults: normalizeScopedResults,
+    reduceScopeSearchEvent: reduceScopeSearchEvent,
     sessionSearchRows: sessionSearchRows,
     iconForFile: iconForFile,
     fuzzyMatchWords: fuzzyMatchWords,

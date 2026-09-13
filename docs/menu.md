@@ -173,8 +173,8 @@ how the pickers behind menu actions (`omarchy-menu-plugin`,
 
 An action containing `{}` is parameterized: when the row is activated, every `{}` occurrence is replaced with user text, shell-quoted, by pure string substitution — never evaluated, so an input like `$(id)` stays literal. What fills it depends on the row:
 
-- A normal action row takes the filter remainder: the filter words after the first (trigger) word. Such rows match a search on the first word alone, so typing `github neovim` still lists the GitHub row and activates it with `neovim`. With a single-word filter the parameter is empty.
-- A row with `input: {"prompt": "...", "action": "..."}` is prompt-first: selecting it opens input mode (prefilled with the filter remainder, if any) and runs the template with the answer on confirm. An empty answer runs nothing. This is how the shipped `ask` (Ask agent…, `omarchy agent prompt {}`) and `search` (Search web…, DuckDuckGo via `xdg-open`) rows work.
+- A normal action row takes the filter remainder: the filter words after the first (trigger) word. Such rows match a search on the first word alone, so typing `github neovim` still lists the GitHub row and activates it with `neovim`. With a single-word filter the parameter is empty. The shipped GitHub and AUR actions live under Search but retain their short aliases for this flow.
+- A row with `input: {"prompt": "...", "action": "..."}` is prompt-first: selecting it opens input mode (prefilled with the filter remainder, if any) and runs the template with the answer on confirm. An empty answer runs nothing. This is how the shipped `ask` (Ask agent…, `omarchy agent prompt {}`) and Search › Web rows work.
 
 In both cases the input is never recorded in the activity database — free text may be secrets, the same rule `omarchy-menu-input` follows. Template authors: the substituted value is already shell-quoted and concatenates with its neighbors, so close static quotes around the placeholder (`'...q='{}'&...'`) rather than wrapping it — wrapping lets the value's quotes pair with the template's and re-split on spaces, while the closed form keeps a static `&` literal inside quotes.
 
@@ -210,6 +210,8 @@ When `scope` is configured on an entry:
 - The entry acts as a submenu (`kind: "menu"`).
 - At the root level, items belonging to that scope are never exposed or dumped into top-level flat search.
 - When the user navigates into the submenu, recent items for that scope are displayed immediately (ranked by frecency score), or a clean placeholder hint is shown if no history exists yet.
-- As the user types, matches from the in-memory frecency database (`frecencyMap`) matching the declared `scope` are queried on demand and ranked by score.
+- As the user types, the hydrated frecency cache supplies immediate provisional matches while a debounced query searches the complete scoped collection through one persistent activity worker. Versioned request IDs reject superseded results, batches of up to eight rows progressively update the existing model, and the terminal event does not trigger a redundant rebuild after populated batches.
+- A backend error is terminal for its request but does not erase provisional or already streamed rows. An unexpected worker exit is retried once for the still-current request. The worker stops after five idle seconds or immediately when the menu closes, directly and without an intermediary shell process.
 - Selecting a match executes the `action` template, replacing `{}` with the quoted key/target of the selected item.
 
+`ScopeSearchController.qml` owns that lifecycle behind a small search/cancel/results contract. `Menu.qml` supplies the active scope and renders results, `MenuModel.js` performs pure row normalization and protocol reduction, and `omarchy-activity` owns SQLite search and ranking. This keeps process state and transport details out of the menu presentation.

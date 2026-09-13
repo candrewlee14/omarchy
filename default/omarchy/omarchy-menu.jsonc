@@ -35,6 +35,7 @@
   "install": {"icon":"󰉉","label":"Install"},
   "remove": {"icon":"󰭌","label":"Remove","aliases":["uninstall"]},
   "update": {"icon":"","label":"Update","aliases":["restart","refresh"]},
+  "search": {"icon":"","label":"Search"},
   "about": {"icon":"","label":"About","action":"omarchy-launch-about"},
   "system": {"icon":"","label":"System","aliases":["power-menu"]},
 
@@ -47,10 +48,9 @@
   // Quicklinks: prompt-first (`input`) and parameterized (`{}`) rows, honored
   // by compatible menus (see docs/menu.md). Template authors: quote static `&`
   // in URLs (close the quotes around {}: '...q='{}'&...') so the value concatenates as one quoted word.
-  "search": {"icon":"","label":"Search web…","description":"Search the web","input":{"prompt":"Search web","action":"omarchy-websearch {}"}},
-  "github": {"icon":"","label":"GitHub…","description":"Search GitHub repositories","action":"xdg-open 'https://github.com/search?q='{}'&type=repositories'"},
-  "aur": {"icon":"󰣇","label":"AUR…","description":"Search the Arch User Repository","action":"xdg-open https://aur.archlinux.org/packages?K={}"},
-  "archwiki": {"icon":"󰖬","label":"Arch Wiki","description":"Open the Arch Wiki","action":"omarchy-launch-webapp 'https://wiki.archlinux.org/'"},
+  "search.web": {"icon":"","label":"Web…","description":"Search the web","input":{"prompt":"Search web","action":"omarchy-websearch {}"}},
+  "search.github": {"icon":"","label":"GitHub…","description":"Search GitHub repositories","aliases":["github"],"action":"xdg-open 'https://github.com/search?q='{}'&type=repositories'"},
+  "search.aur": {"icon":"󰣇","label":"AUR…","description":"Search the Arch User Repository","aliases":["aur"],"action":"xdg-open https://aur.archlinux.org/packages?K={}"},
 
   // System
   "system.screensaver": {"icon":"󱄄","label":"Screensaver","action":"omarchy-launch-screensaver force"},
@@ -65,7 +65,7 @@
   "learn.keybindings": {"icon":"","label":"Keybindings","action":"omarchy-menu-keybindings"},
   "learn.omarchy": {"icon":"","label":"Omarchy","action":"omarchy-launch-webapp 'https://omarchy.org/manual/'"},
   "learn.hyprland": {"icon":"","label":"Hyprland","action":"omarchy-launch-webapp 'https://wiki.hypr.land/'"},
-  "learn.arch": {"icon":"󰣇","label":"Arch","action":"omarchy-launch-webapp 'https://wiki.archlinux.org/title/Main_page'"},
+  "learn.arch": {"icon":"󰣇","label":"Arch","aliases":["archwiki"],"action":"omarchy-launch-webapp 'https://wiki.archlinux.org/title/Main_page'"},
   "learn.neovim": {"icon":"","label":"Neovim","action":"omarchy-launch-webapp 'https://www.lazyvim.org/keymaps'"},
   "learn.bash": {"icon":"󱆃","label":"Bash","action":"omarchy-launch-webapp 'https://devhints.io/bash'"},
   "learn.tmux-keybindings": {"icon":"","label":"Tmux","action":"omarchy-menu-tmux-keybindings"},

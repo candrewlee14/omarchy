@@ -8,6 +8,7 @@ run_node_test <<'JS'
 const fs = require('fs')
 const menu = requireFromRoot('shell/plugins/menu/MenuModel.js')
 const menuQml = fs.readFileSync(path.join(root, 'shell/plugins/menu/Menu.qml'), 'utf8')
+const scopeSearchQml = fs.readFileSync(path.join(root, 'shell/plugins/menu/ScopeSearchController.qml'), 'utf8')
 const defaultMenuJsonc = fs.readFileSync(path.join(root, 'default/omarchy/omarchy-menu.jsonc'), 'utf8')
 
 const parsed = menu.parseMenuJsonc(`
@@ -130,6 +131,17 @@ assertDeepEqual(
 const defaultItems = menu.parseMenuJsonc(defaultMenuJsonc)
 const defaultById = Object.fromEntries(defaultItems.map(item => [item.id, item]))
 
+assertEqual(defaultById.search.kind, 'menu', 'menu groups web searches in a Search submenu')
+assertDeepEqual(
+  defaultItems.filter(item => item.parent === 'search').map(item => item.id),
+  ['search.web', 'search.github', 'search.aur'],
+  'menu keeps Web, GitHub, and AUR under Search'
+)
+assert(!defaultById.github && !defaultById.aur && !defaultById.archwiki, 'menu keeps search services and Arch Wiki out of the root')
+assert(defaultById['search.github'].aliases.includes('github'), 'menu preserves the GitHub route as an alias')
+assert(defaultById['search.aur'].aliases.includes('aur'), 'menu preserves the AUR route as an alias')
+assert(defaultById['learn.arch'].aliases.includes('archwiki'), 'menu preserves the Arch Wiki route on Learn > Arch')
+
 // Needs the real menu: app rows sort after all menu items, and only at that
 // item count does the order tiebreak alone bury an installed app.
 const rankBase = menu.mergeMenuSources(defaultItems, [])
@@ -165,6 +177,9 @@ const routed = menu.mergeAppRows(rankBase.items, rankBase.itemOrder, [
 assertEqual(menu.resolveRoute(routed.items, routed.itemOrder, 'system'), 'system', 'menu routes an exact id even when an app keyword matches it')
 assertEqual(menu.resolveRoute(routed.items, routed.itemOrder, 'process'), 'process', 'menu never routes to an app row through its keywords')
 assertEqual(menu.resolveRoute(routed.items, routed.itemOrder, 'power-menu'), 'system', 'menu routes declared aliases to their item')
+assertEqual(menu.resolveRoute(routed.items, routed.itemOrder, 'github'), 'search.github', 'menu preserves the former GitHub route below Search')
+assertEqual(menu.resolveRoute(routed.items, routed.itemOrder, 'aur'), 'search.aur', 'menu preserves the former AUR route below Search')
+assertEqual(menu.resolveRoute(routed.items, routed.itemOrder, 'archwiki'), 'learn.arch', 'menu preserves the former Arch Wiki route below Learn')
 assertEqual(menu.resolveRoute(routed.items, routed.itemOrder, 'power_menu'), 'system', 'menu normalizes underscores in routes')
 assertEqual(menu.resolveRoute(routed.items, routed.itemOrder, ''), 'root', 'menu routes empty input to root')
 assertEqual(menu.resolveRoute(routed.items, routed.itemOrder, 'no-such-route'), 'no-such-route', 'menu falls through to the literal input')
@@ -749,6 +764,43 @@ const matchScoped = menu.scopedSearchRows(richFrecency, 'agent-session', 'schema
 assertEqual(matchScoped.length, 1, 'scopedSearchRows lazily matches session by keyword')
 assertEqual(matchScoped[0].label, 'Fix schema bug', 'scopedSearchRows uses item title')
 assertEqual(matchScoped[0].action, "omarchy agent resume '01a079e9-sess'", 'scopedSearchRows configures templated action')
+
+const normalizedScoped = menu.normalizeScopedResults([
+  { target: "session'one", label: 'Session one', score: 7 }
+], 'agent-session', 'omarchy agent resume {}', '')
+assertEqual(normalizedScoped[0].kind, 'agent-session', 'streamed scope results inherit their declared kind')
+assertEqual(normalizedScoped[0].icon, '', 'streamed scope results inherit their fallback icon')
+assertEqual(normalizedScoped[0].action, "omarchy agent resume 'session'\\''one'", 'streamed scope results safely receive the menu action template')
+
+const firstBatch = menu.reduceScopeSearchEvent([], false, {
+  version: 1, source: 'activity', queryId: '7', type: 'rows', rows: [{ target: 'one' }]
+}, '7')
+assert(firstBatch.accepted && firstBatch.started && firstBatch.changed, 'scope search reducer accepts a correlated row batch')
+assertEqual(firstBatch.rows.length, 1, 'scope search reducer appends streamed rows')
+const staleBatch = menu.reduceScopeSearchEvent(firstBatch.rows, true, {
+  version: 1, source: 'activity', queryId: '6', type: 'rows', rows: [{ target: 'stale' }]
+}, '7')
+assert(!staleBatch.accepted && staleBatch.rows.length === 1, 'scope search reducer rejects stale query ids')
+const populatedDone = menu.reduceScopeSearchEvent(firstBatch.rows, true, {
+  version: 1, source: 'activity', queryId: '7', type: 'done'
+}, '7')
+assert(populatedDone.terminal && !populatedDone.changed, 'scope search reducer avoids a redundant populated done update')
+const emptyDone = menu.reduceScopeSearchEvent([], false, {
+  version: 1, source: 'activity', queryId: '7', type: 'done'
+}, '7')
+assert(emptyDone.terminal && emptyDone.changed, 'scope search reducer publishes a terminal empty result')
+const failedSearch = menu.reduceScopeSearchEvent(firstBatch.rows, true, {
+  version: 1, source: 'activity', queryId: '7', type: 'error', message: 'database unavailable'
+}, '7')
+assert(failedSearch.terminal && failedSearch.failed && !failedSearch.changed && failedSearch.rows.length === 1, 'scope search reducer preserves rows on backend errors')
+
+assert(menuQml.includes('ScopeSearchController {'), 'menu delegates lazy-search lifecycle to one controller')
+assert(menuQml.includes('scopeSearch.search(activeEntry.scope, query)'), 'menu schedules scoped queries through the controller contract')
+assert(scopeSearchQml.includes('stdout: SplitParser {'), 'scope search consumes asynchronous results as a delimited stream')
+assert(scopeSearchQml.includes('stdinEnabled: true'), 'scope search keeps a persistent worker')
+assert(scopeSearchQml.includes('command: ["omarchy-activity", "search", "--worker"]'), 'scope search bypasses an intermediary shell for reliable worker lifecycle')
+assert(scopeSearchQml.includes('worker.generation !== controller.generation'), 'scope search rejects results from stale generations')
+assert(scopeSearchQml.includes('queryId: String(worker.generation)'), 'scope search correlates worker requests with generations')
 JS
 
 font_charset=$(fc-query --format='%{charset}' "$ROOT/default/fonts/omarchy/omarchy.ttf")

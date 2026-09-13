@@ -90,7 +90,7 @@ Item {
   // bin/omarchy-activity): every consumer records picks there and hydrates
   // this map on open. The local entry is updated optimistically so the pick
   // re-ranks immediately, even before the next open re-reads the database.
-  function recordFrecency(kind, key, title) {
+  function recordFrecency(kind, key, title, searchQuery) {
     if (!key) return
     var map = root.frecencyMap || ({})
     var entry = map[key] || { count: 0, lastUsed: 0 }
@@ -100,7 +100,9 @@ Item {
     if (title) entry.title = title
     map[key] = entry
     root.frecencyMap = map
-    Util.execDetached("omarchy-activity record " + Util.shellQuote(kind || "menu") + " " + Util.shellQuote(key) + " " + Util.shellQuote(title || ""))
+    var command = "omarchy-activity record " + Util.shellQuote(kind || "menu") + " " + Util.shellQuote(key) + " " + Util.shellQuote(title || "")
+    if (searchQuery) command += " --query " + Util.shellQuote(searchQuery)
+    Util.execDetached(command)
   }
 
   function loadFrecency() {
@@ -121,8 +123,7 @@ Item {
   onOpenedChanged: if (!opened) {
     deleteConfirmOpen = false
     deleteTarget = null
-    scopeSearchTimer.stop()
-    scopeSearchProc.pendingQuery = ""
+    scopeSearch.shutdown()
   }
   // Bound to the central [menu] section in shell.toml via Color.qml.
   // Each color already includes its alpha companion (composed in the
@@ -159,7 +160,7 @@ Item {
     || calcDebounceTimer.running || fendProc.running || fendProc.pendingQuery !== ""
     || providerProc.running || root.providerQueue.length > 0
     || guardProc.running || root.guardsPending || frecencyProc.running
-    || scopeSearchTimer.running || scopeSearchProc.running || scopeSearchProc.pendingQuery !== ""
+    || scopeSearch.pending
   property int cardWidth: Math.min(root.dmenuActive ? Style.space(root.dmenuWidth) : ((root.filterText.trim().length > 0 || (root.item(root.activeMenu) && root.item(root.activeMenu).scope) || root.activeMenu === "trigger.capture.screenrecord" || root.activeMenu === "style.font") ? Style.space(420) : Style.space(300)), panel.width - Style.gapsOut * 2)
   property int visibleRowsHeight: root.dmenuActive ? dmenuRowListHeight(layoutSerial, displayModel.count, filterText) : rowListHeight(layoutSerial, displayModel.count, filterText, searchDivider)
   property int cardHeight: root.dmenuActive
@@ -682,12 +683,6 @@ Item {
     if (activeEntry && activeEntry.scope) {
       var scopedRows = []
       if (!query) {
-        root.scopeSearchResults = []
-        root.scopeSearchLastQuery = ""
-        root.scopeSearchLastScope = ""
-        scopeSearchTimer.stop()
-        scopeSearchProc.pendingQuery = ""
-
         scopedRows = MenuModel.scopedSearchRows(
           root.frecencyMap,
           activeEntry.scope,
@@ -697,37 +692,13 @@ Item {
           activeEntry.icon
         )
       } else {
-        if (root.scopeSearchLastScope === activeEntry.scope && root.scopeSearchLastQuery === query) {
-          var results = root.scopeSearchResults || []
-          for (var r = 0; r < results.length; r++) {
-            var item = results[r]
-            var rowAction = item.action || ""
-            if (!rowAction && activeEntry.action) {
-              rowAction = activeEntry.action.indexOf("{}") >= 0
-                ? activeEntry.action.replace("{}", "'" + String(item.target).replace(/'/g, "'\\''") + "'")
-                : activeEntry.action + " '" + String(item.target).replace(/'/g, "'\\''") + "'"
-            }
-            var rowIcon = item.icon || activeEntry.icon || ""
-            var rowIconFont = item.iconFont || activeEntry.iconFont || ""
-            scopedRows.push({
-              itemId: item.itemId || (activeEntry.scope + "." + item.target),
-              disabled: false,
-              kind: item.kind || activeEntry.scope,
-              icon: rowIcon,
-              iconFont: rowIconFont,
-              appIcon: item.appIcon || "",
-              appId: item.appId || "",
-              label: item.label || item.target,
-              target: item.target || "",
-              detail: item.detail || item.target,
-              path: item.path || "",
-              childCount: 0,
-              action: rowAction,
-              provider: item.provider || "",
-              score: typeof item.score === "number" ? item.score : 0,
-              section: ""
-            })
-          }
+        if (scopeSearch.hasResults(activeEntry.scope, query)) {
+          scopedRows = MenuModel.normalizeScopedResults(
+            scopeSearch.results,
+            activeEntry.scope,
+            activeEntry.action,
+            activeEntry.icon
+          )
         } else {
           scopedRows = MenuModel.scopedSearchRows(
             root.frecencyMap,
@@ -737,7 +708,7 @@ Item {
             activeEntry.action,
             activeEntry.icon
           )
-          scopeSearchTimer.restart()
+          scopeSearch.search(activeEntry.scope, query)
         }
       }
 
@@ -1028,6 +999,7 @@ Item {
 
   function setFilter(nextFilter) {
     panel.freezeCardTop()
+    scopeSearch.cancel()
     root.filterText = nextFilter
     root.selectedIndex = 0
     root.cursorActive = root.mode !== "input"
@@ -1044,6 +1016,7 @@ Item {
 
   function setActiveMenu(id, pushHistory, fromPointer) {
     panel.freezeCardTop()
+    scopeSearch.cancel()
     if (!root.item(id)) id = "root"
     if (pushHistory && id !== root.activeMenu) root.navStack = root.navStack.concat([root.activeMenu])
     root.activeMenu = id
@@ -1052,11 +1025,6 @@ Item {
     root.cursorActive = true
     if (fromPointer) pointerGate.allowInitialSample()
     else root.disarmPointer()
-    root.scopeSearchResults = []
-    root.scopeSearchLastQuery = ""
-    root.scopeSearchLastScope = ""
-    scopeSearchTimer.stop()
-    scopeSearchProc.pendingQuery = ""
     var activeEntry = root.item(id)
     if (activeEntry && activeEntry.scope) root.loadFrecency()
     root.rebuildDisplay()
@@ -1099,6 +1067,8 @@ Item {
     if (!root.rowSelectable(index)) return
 
     var row = displayModel.get(index)
+    var activeScopeEntry = root.item(root.activeMenu)
+    var scopedQuery = activeScopeEntry && activeScopeEntry.scope === row.kind ? root.filterText.trim() : ""
     if (row.kind === "calc") {
       Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(row.label) + " | wl-copy && omarchy-notification-send -g 󰪚 'Copied to clipboard' " + Util.shellQuote(row.label)])
       root.opened = false
@@ -1119,13 +1089,13 @@ Item {
       filterText = ""
       if (root.appLibrary) root.appLibrary.launch(appId, label)
     } else if (row.kind === "file" || row.kind === "project") {
-      root.recordFrecency(row.kind, row.target, row.label)
+      root.recordFrecency(row.kind, row.target, row.label, scopedQuery)
       applySerial = requestSerial
       opened = false
       filterText = ""
       root.runAction("xdg-open " + Util.shellQuote(row.target))
     } else if (row.target && row.action) {
-      root.recordFrecency(row.kind, row.target, row.label)
+      root.recordFrecency(row.kind, row.target, row.label, scopedQuery)
       applySerial = requestSerial
       opened = false
       filterText = ""
@@ -1256,6 +1226,7 @@ Item {
   }
 
   function openExistingMenu(initialMenu) {
+    scopeSearch.cancel()
     requestSerial += 1
     mode = "menu"
     root.inputForwardAction = ""
@@ -1282,6 +1253,7 @@ Item {
   }
 
   function openDmenu(payload) {
+    scopeSearch.cancel()
     requestSerial += 1
     root.inputForwardAction = ""
     mode = payload.mode === "input" ? "input" : "select"
@@ -1396,80 +1368,10 @@ Item {
     onTriggered: root.rebuildDisplay()
   }
 
-  property var scopeSearchResults: []
-  property string scopeSearchLastQuery: ""
-  property string scopeSearchLastScope: ""
-
-  Timer {
-    id: scopeSearchTimer
-    interval: 40
-    repeat: false
-    onTriggered: {
-      var activeEntry = root.item(root.activeMenu)
-      var scope = activeEntry && activeEntry.scope ? activeEntry.scope : ""
-      var q = root.filterText.trim()
-      if (scope && q) {
-        root.launchScopeSearch(scope, q)
-      }
-    }
-  }
-
-  function launchScopeSearch(scope, q) {
-    if (scopeSearchProc.running) {
-      scopeSearchProc.pendingScope = scope
-      scopeSearchProc.pendingQuery = q
-      return
-    }
-    scopeSearchProc.pendingScope = ""
-    scopeSearchProc.pendingQuery = ""
-    scopeSearchProc.activeScope = scope
-    scopeSearchProc.candidateQuery = q
-    scopeSearchProc.command = ["bash", "-lc", "omarchy-activity search " + Util.shellQuote(q) + " --kind " + Util.shellQuote(scope) + " --limit 15"]
-    scopeSearchProc.running = true
-  }
-
-  Process {
-    id: scopeSearchProc
-    property string activeScope: ""
-    property string candidateQuery: ""
-    property string pendingScope: ""
-    property string pendingQuery: ""
-
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var activeEntry = root.item(root.activeMenu)
-        var curScope = activeEntry && activeEntry.scope ? activeEntry.scope : ""
-        var curQuery = root.filterText.trim()
-
-        if (scopeSearchProc.activeScope === curScope && scopeSearchProc.candidateQuery === curQuery) {
-          try {
-            var results = JSON.parse(text)
-            if (Array.isArray(results)) {
-              root.scopeSearchResults = results
-              root.scopeSearchLastScope = curScope
-              root.scopeSearchLastQuery = curQuery
-              root.rebuildDisplay()
-            }
-          } catch (e) {}
-        }
-      }
-    }
-
-    onExited: function(exitCode, exitStatus) {
-      var pending = scopeSearchProc.pendingQuery
-      var pendingScope = scopeSearchProc.pendingScope
-      scopeSearchProc.pendingQuery = ""
-      scopeSearchProc.pendingScope = ""
-
-      var activeEntry = root.item(root.activeMenu)
-      var curScope = activeEntry && activeEntry.scope ? activeEntry.scope : ""
-      var curQuery = root.filterText.trim()
-
-      if (pending && curScope && pending === curQuery && (pending !== scopeSearchProc.candidateQuery || pendingScope !== scopeSearchProc.activeScope)) {
-        root.launchScopeSearch(curScope, pending)
-      }
-    }
+  ScopeSearchController {
+    id: scopeSearch
+    active: root.opened
+    onResultsReady: root.rebuildDisplay()
   }
 
   // `fend` runs async, and Process ignores a command change while a run is
