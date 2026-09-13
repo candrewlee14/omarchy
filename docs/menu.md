@@ -164,6 +164,8 @@ for scripts and terminals.
 
 Press `Ctrl+K` on a selected result, or right-click it, to open its action panel. The first row is the result's normal Enter behavior. Files and projects also expose their containing folder, path copying, and removal from activity history; agent conversations expose session-id copying and history removal; applications expose uninstall. `MenuModel.js` declares reusable action definitions and the ordered action set for each result kind. `ActionPanel.qml` only presents those descriptors, while `Menu.qml` executes their small, stable operation vocabulary. This keeps row-specific capabilities out of keyboard and pointer handlers and lets each kind grow multiple actions without another input-handler branch.
 
+Previewable results expand the card with a descriptor-driven pane. Applications show their desktop icon; supported images and PDFs render directly through Qt; known text formats load asynchronously with a hard 12 KiB read cap; opaque files, projects, and conversations show structured metadata. `MenuModel.js` maps result kinds and file extensions to preview descriptors, while `PreviewPane.qml` owns bounded loading and presentation. Moving the cursor across ordinary command rows never starts preview work or widens the card.
+
 ## Select and input modes
 
 The same plugin doubles as the system's dmenu. `omarchy-menu-select` and

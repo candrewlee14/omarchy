@@ -627,6 +627,58 @@ var FILE_ICONS = {
   "\uf121": ["c", "h", "cpp", "hpp", "java", "kt", "swift", "cs", "php", "pl", "rb", "sql", "vim", "xml", "makefile"]
 }
 
+var IMAGE_PREVIEW_EXTENSIONS = {
+  png: true, jpg: true, jpeg: true, gif: true, webp: true, svg: true,
+  bmp: true, ico: true, tif: true, tiff: true, avif: true, pdf: true
+}
+
+var TEXT_PREVIEW_EXTENSIONS = {
+  txt: true, md: true, markdown: true, rst: true, log: true,
+  py: true, js: true, jsx: true, mjs: true, cjs: true, ts: true, tsx: true,
+  rs: true, go: true, lua: true, sh: true, bash: true, zsh: true, fish: true,
+  json: true, yaml: true, yml: true, toml: true, html: true, htm: true,
+  css: true, scss: true, c: true, h: true, cpp: true, hpp: true,
+  java: true, kt: true, swift: true, cs: true, php: true, pl: true,
+  rb: true, sql: true, vim: true, xml: true, makefile: true
+}
+
+var RESULT_PREVIEW_KINDS = {
+  app: "app",
+  file: "file",
+  project: "metadata",
+  "agent-session": "metadata"
+}
+
+function fileExtension(path) {
+  var name = String(path || "").split("/").pop().toLowerCase()
+  if (name === "makefile" || name === "dockerfile") return name
+  var dot = name.lastIndexOf(".")
+  return dot > 0 ? name.slice(dot + 1) : ""
+}
+
+function previewForRow(row) {
+  if (!row || row.disabled) return { kind: "" }
+  var declaredKind = RESULT_PREVIEW_KINDS[row.kind] || ""
+  if (!declaredKind) return { kind: "" }
+  var previewKind = declaredKind
+  if (declaredKind === "file") {
+    var extension = fileExtension(row.target)
+    previewKind = IMAGE_PREVIEW_EXTENSIONS[extension] ? "image"
+      : TEXT_PREVIEW_EXTENSIONS[extension] ? "text"
+      : "metadata"
+  }
+  return {
+    kind: previewKind,
+    resultKind: row.kind,
+    title: row.label || row.target || "",
+    subtitle: row.detail || "",
+    target: row.target || "",
+    icon: row.icon || "",
+    iconFont: row.iconFont || "",
+    appIcon: row.appIcon || ""
+  }
+}
+
 function iconForFile(path) {
   var name = String(path || "").split("/").pop().toLowerCase()
   if (name === "dockerfile" || name.indexOf("docker-compose") === 0) return "\ue7b0"
@@ -1022,6 +1074,8 @@ if (typeof module !== "undefined") {
     matchesQuery: matchesQuery,
     searchScore: searchScore,
     fileSearchRows: fileSearchRows,
+    fileExtension: fileExtension,
+    previewForRow: previewForRow,
     scopedSearchRows: scopedSearchRows,
     normalizeScopedResults: normalizeScopedResults,
     parentDirectory: parentDirectory,

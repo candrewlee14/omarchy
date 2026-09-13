@@ -162,11 +162,23 @@ Item {
     || providerProc.running || root.providerQueue.length > 0
     || guardProc.running || root.guardsPending || frecencyProc.running
     || scopeSearch.pending
-  property int cardWidth: Math.min(root.dmenuActive ? Style.space(root.dmenuWidth) : ((root.filterText.trim().length > 0 || (root.item(root.activeMenu) && root.item(root.activeMenu).scope) || root.activeMenu === "trigger.capture.screenrecord" || root.activeMenu === "style.font") ? Style.space(420) : Style.space(300)), panel.width - Style.gapsOut * 2)
+  function previewDescriptor(serial, index) {
+    if (!root.cursorActive || index < 0 || index >= displayModel.count) return { kind: "" }
+    return MenuModel.previewForRow(displayModel.get(index))
+  }
+  readonly property var resultPreview: root.previewDescriptor(layoutSerial, selectedIndex)
+  readonly property bool previewVisible: !root.dmenuActive && resultPreview.kind !== ""
+    && !root.deleteConfirmOpen && !actionPanel.opened
+  readonly property int previewPaneWidth: Style.space(300)
+  readonly property int baseCardWidth: root.dmenuActive ? Style.space(root.dmenuWidth)
+    : ((root.filterText.trim().length > 0 || (root.item(root.activeMenu) && root.item(root.activeMenu).scope)
+      || root.activeMenu === "trigger.capture.screenrecord" || root.activeMenu === "style.font") ? Style.space(420) : Style.space(300))
+  property int cardWidth: Math.min(baseCardWidth + (previewVisible ? Style.space(320) : 0), panel.width - Style.gapsOut * 2)
   property int visibleRowsHeight: root.dmenuActive ? dmenuRowListHeight(layoutSerial, displayModel.count, filterText) : rowListHeight(layoutSerial, displayModel.count, filterText, searchDivider)
   property int cardHeight: root.dmenuActive
     ? Math.min(contentMargin * 2 + headerHeight + (mode === "input" ? 0 : contentSpacing + visibleRowsHeight), panel.height - Style.gapsOut * 2)
-    : Math.min(contentMargin * 2 + headerHeight + contentSpacing + visibleRowsHeight, panel.height - Style.gapsOut * 2)
+    : Math.min(Math.max(contentMargin * 2 + headerHeight + contentSpacing + visibleRowsHeight,
+      previewVisible ? Style.space(390) : 0), panel.height - Style.gapsOut * 2)
 
   function finishRequest(selection) {
     if (!root.requestActive || !root.doneFile) {
@@ -1794,11 +1806,16 @@ Item {
       }
 
       Column {
-        anchors.fill: parent
+        id: menuContent
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
         anchors.topMargin: card.contentTopInset
-        anchors.rightMargin: card.contentRightInset
         anchors.bottomMargin: card.contentBottomInset
         anchors.leftMargin: card.contentLeftInset
+        width: root.previewVisible
+          ? parent.width - card.contentLeftInset - card.contentRightInset - root.previewPaneWidth - root.contentSpacing
+          : parent.width - card.contentLeftInset - card.contentRightInset
         spacing: root.contentSpacing
 
         Rectangle {
@@ -2084,6 +2101,23 @@ Item {
           width: parent.width
           height: 0
         }
+      }
+
+      PreviewPane {
+        id: previewPane
+        visible: root.previewVisible
+        width: root.previewPaneWidth
+        anchors.right: parent.right
+        anchors.rightMargin: card.contentRightInset
+        anchors.top: parent.top
+        anchors.topMargin: card.contentTopInset
+        anchors.bottom: parent.bottom
+        anchors.bottomMargin: card.contentBottomInset
+        descriptor: root.resultPreview
+        appLibrary: root.appLibrary
+        foreground: root.foreground
+        background: root.background
+        fontFamily: root.fontFamily
       }
     }
   }
